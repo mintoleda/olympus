@@ -37,8 +37,16 @@
   type SessionEvent = { session_id: string; message: ChatMessage };
   type SessionUpdateEvent = { session: PiSession };
   type PiModelOption = { provider: string; id: string; context: string; max_output: string; reasoning: boolean; images: boolean };
-  type PiCommandOption = { name: string; description: string; source: string };
+  type PiCommandOption = { name: string; description: string; source: string; location?: string; path?: string };
   type ExtensionUiRequest = { session_id: string; request: Record<string, any> };
+  type StatusEntry = { key: string; text: string };
+  type StatusEvent = { session_id: string; statuses: StatusEntry[] };
+  type WidgetEntry = { key: string; lines: string[]; placement: string };
+  type WidgetEvent = { session_id: string; widgets: WidgetEntry[] };
+  type NotifyEvent = { session_id: string; message: string; level: string };
+  type EditorTextEvent = { session_id: string; text: string };
+  type PrimaryPreset = 'plan' | 'build' | 'ask' | 'off';
+  const PRIMARY_CYCLE: PrimaryPreset[] = ['plan', 'build', 'ask', 'off'];
   type ConfigChooser = 'provider' | 'model' | 'thinking' | null;
 
   const thinkingLevels = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh'];
@@ -61,7 +69,11 @@
   let modelLoading = false;
   let modelFilter = '';
   let commandOptions: PiCommandOption[] = [];
+  let commandCache = new Map<string, PiCommandOption[]>();
+  let commandFetchInFlight = '';
   let extensionRequest: ExtensionUiRequest | null = null;
+  let sessionStatuses = new Map<string, StatusEntry[]>();
+  let sessionWidgets = new Map<string, WidgetEntry[]>();
   let rootEl: HTMLElement;
   let chatLogEl: HTMLElement;
   let zoom = 1;
@@ -107,10 +119,17 @@
   $: filteredModels = activeProviderModels
     .filter((model) => !modelSearch || model.id.toLowerCase().includes(modelSearch))
     .slice(0, 160);
-  $: commandSearch = draft.startsWith('/') ? draft.slice(1).toLowerCase() : '';
-  $: visibleCommands = draft.startsWith('/')
-    ? commandOptions.filter((command) => command.name.toLowerCase().includes(commandSearch)).slice(0, 12)
-    : [];
+  $: activeStatuses = activeSession ? sessionStatuses.get(activeSession.id) ?? [] : [];
+  $: activeWidgets = activeSession ? sessionWidgets.get(activeSession.id) ?? [] : [];
+  $: presetStatus = activeStatuses.find((entry) => entry.key === 'opencode-preset' || entry.key === 'preset');
+  $: activePreset = parsePreset(presetStatus?.text);
+  $: nonPresetStatuses = activeStatuses
+    .filter((entry) => entry.key !== 'opencode-preset' && entry.key !== 'preset')
+    .filter((entry) => stripAnsi(entry.text).trim().length > 0);
+  $: aboveWidgets = activeWidgets.filter((widget) => widget.placement !== 'belowEditor');
+  $: belowWidgets = activeWidgets.filter((widget) => widget.placement === 'belowEditor');
+  $: commandSearch = draft.startsWith('/') ? draft.slice(1).split(/\s+/, 1)[0].toLowerCase() : '';
+  $: visibleCommands = draft.startsWith('/') ? rankCommands(commandOptions, commandSearch).slice(0, 12) : [];
   $: homeStats = [
     { label: 'Sessions', value: String(sessions.length).padStart(2, '0'), note: sessions.length === 1 ? 'context mounted' : 'contexts mounted' },
     { label: 'Project', value: activeProjectName, note: activeSession?.status ?? 'waiting' },
@@ -133,6 +152,11 @@
       animateInspectorRefresh(rootEl);
       animateActiveNav(rootEl);
     });
+  }
+  $: if (activeSession?.id) {
+    const cached = commandCache.get(activeSession.id);
+    commandOptions = cached ?? [];
+    loadCommandOptions(activeSession.id);
   }
   $: if (animationReady && rootEl && sessions.length !== lastAnimatedSessionCount) {
     lastAnimatedSessionCount = sessions.length;
@@ -158,6 +182,34 @@
   }
 
   const timeFormatter = new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit' });
+
+  function stripAnsi(text: string): string {
+    return text ? text.replace(/\[[0-9;]*[A-Za-z]/g, '') : '';
+  }
+
+  function parsePreset(text: string | undefined): PrimaryPreset | undefined {
+    if (!text) return undefined;
+    const cleaned = stripAnsi(text).trim().toLowerCase();
+    const match = cleaned.match(/primary\s*[:=]\s*(plan|build|ask|off)/);
+    if (match) return match[1] as PrimaryPreset;
+    if (['plan', 'build', 'ask', 'off'].includes(cleaned)) return cleaned as PrimaryPreset;
+    return undefined;
+  }
+
+  function nextPreset(current: PrimaryPreset | undefined, direction: 1 | -1): PrimaryPreset {
+    const idx = current ? PRIMARY_CYCLE.indexOf(current) : -1;
+    const len = PRIMARY_CYCLE.length;
+    const nextIdx = direction === 1
+      ? (idx + 1 + len) % len
+      : (idx <= 0 ? len - 1 : idx - 1);
+    return PRIMARY_CYCLE[nextIdx];
+  }
+
+  async function cyclePrimary(direction: 1 | -1 = 1) {
+    if (!activeSession) return;
+    const target = nextPreset(activePreset, direction);
+    await runAction(() => invoke('send_pi_command', { id: activeSession!.id, content: `/primary ${target}` }));
+  }
 
   function formatTime(timestamp: number) {
     if (!timestamp) return 'no activity';
@@ -248,19 +300,33 @@
     document.documentElement.style.setProperty('--app-zoom', String(zoom));
   }
 
-  function handleZoomShortcut(event: KeyboardEvent) {
-    if (!event.ctrlKey && !event.metaKey) return;
-    if (event.key === '+' || event.key === '=') {
+  function handleGlobalKeydown(event: KeyboardEvent) {
+    if ((event.ctrlKey || event.metaKey) && !event.shiftKey) {
+      if (event.key === '+' || event.key === '=') {
+        event.preventDefault();
+        setZoom(zoom + 0.05);
+        return;
+      }
+      if (event.key === '-' || event.key === '_') {
+        event.preventDefault();
+        setZoom(zoom - 0.05);
+        return;
+      }
+      if (event.key === '0') {
+        event.preventDefault();
+        setZoom(1);
+        return;
+      }
+    }
+    if (event.key === 'Tab' && event.shiftKey) {
+      const promptEl = document.getElementById('prompt-input');
+      if (!promptEl || document.activeElement !== promptEl) return;
       event.preventDefault();
-      setZoom(zoom + 0.05);
-    } else if (event.key === '-' || event.key === '_') {
-      event.preventDefault();
-      setZoom(zoom - 0.05);
-    } else if (event.key === '0') {
-      event.preventDefault();
-      setZoom(1);
+      cyclePrimary(event.ctrlKey || event.metaKey ? -1 : 1);
     }
   }
+
+  let hotkeysOpen = false;
 
   async function handleSlashCommand(content: string): Promise<boolean> {
     const [command, ...rest] = content.slice(1).split(/\s+/);
@@ -273,6 +339,9 @@
         return true;
       case 'settings':
         activePane = 'settings';
+        return true;
+      case 'hotkeys':
+        hotkeysOpen = true;
         return true;
       case 'new':
         await createSession();
@@ -299,20 +368,77 @@
         sessionsCollapsed = false;
         return true;
       case 'quit':
+        if (activeSession) await closeSession(activeSession.id);
         return true;
       default:
         return false;
     }
   }
 
+  function fuzzyScore(name: string, query: string): number {
+    if (!query) return 1;
+    const lower = name.toLowerCase();
+    if (lower === query) return 1000;
+    if (lower.startsWith(query)) return 500 - (lower.length - query.length);
+    let qi = 0;
+    let score = 0;
+    let prevMatch = -2;
+    for (let i = 0; i < lower.length && qi < query.length; i++) {
+      if (lower[i] === query[qi]) {
+        score += 10;
+        if (i === prevMatch + 1) score += 8;
+        if (i === 0 || /[^a-z0-9]/.test(lower[i - 1])) score += 5;
+        prevMatch = i;
+        qi++;
+      }
+    }
+    if (qi < query.length) return -1;
+    return score - (lower.length - query.length);
+  }
+
+  function rankCommands(commands: PiCommandOption[], query: string): PiCommandOption[] {
+    if (!query) return [...commands].sort((a, b) => a.name.localeCompare(b.name));
+    const scored = commands
+      .map((command) => ({ command, score: fuzzyScore(command.name, query) }))
+      .filter((entry) => entry.score >= 0)
+      .sort((a, b) => b.score - a.score || a.command.name.localeCompare(b.command.name));
+    return scored.map((entry) => entry.command);
+  }
+
+  async function loadCommandOptions(sessionId: string, force = false) {
+    if (!sessionId) return;
+    if (!force) {
+      const cached = commandCache.get(sessionId);
+      if (cached) {
+        commandOptions = cached;
+        return;
+      }
+    }
+    if (commandFetchInFlight === sessionId) return;
+    commandFetchInFlight = sessionId;
+    try {
+      const commands = await runAction(() => invoke<PiCommandOption[]>('list_pi_commands', { id: sessionId }));
+      if (commands) {
+        commandCache.set(sessionId, commands);
+        if (activeSession?.id === sessionId) commandOptions = commands;
+      }
+    } finally {
+      if (commandFetchInFlight === sessionId) commandFetchInFlight = '';
+    }
+  }
+
   async function ensureCommandOptions() {
-    if (!activeSession || commandOptions.length) return;
-    const commands = await runAction(() => invoke<PiCommandOption[]>('list_pi_commands', { id: activeSession!.id }));
-    if (commands) commandOptions = commands;
+    if (!activeSession) return;
+    await loadCommandOptions(activeSession.id);
+  }
+
+  async function refreshCommandOptions() {
+    if (!activeSession) return;
+    await loadCommandOptions(activeSession.id, true);
   }
 
   function chooseCommand(command: PiCommandOption) {
-    draft = `/${command.name}${command.name === 'name' || command.name === 'compact' ? ' ' : ''}`;
+    draft = `/${command.name} `;
   }
 
   async function respondToExtensionRequest(response: Record<string, any>) {
@@ -373,7 +499,7 @@
     let unlisteners: Array<() => void> = [];
     let disposed = false;
     setZoom(zoom);
-    window.addEventListener('keydown', handleZoomShortcut);
+    window.addEventListener('keydown', handleGlobalKeydown);
     const detachInteractions = attachInteractionAnimations(rootEl);
     animationScope = createAppAnimationScope(rootEl);
     animateShellEnter(rootEl, animationScope);
@@ -416,13 +542,44 @@
         const extensionCleanup = await listen<ExtensionUiRequest>('pi://extension-ui-request', (event) => {
           extensionRequest = event.payload;
         });
+        const statusCleanup = await listen<StatusEvent>('pi://status', (event) => {
+          const next = new Map(sessionStatuses);
+          next.set(event.payload.session_id, event.payload.statuses);
+          sessionStatuses = next;
+        });
+        const widgetCleanup = await listen<WidgetEvent>('pi://widget', (event) => {
+          const next = new Map(sessionWidgets);
+          next.set(event.payload.session_id, event.payload.widgets);
+          sessionWidgets = next;
+        });
+        const notifyCleanup = await listen<NotifyEvent>('pi://notify', (event) => {
+          const { session_id, message, level } = event.payload;
+          sessions = sessions.map((session) => session.id === session_id ? {
+            ...session,
+            messages: [...session.messages, {
+              id: `${session_id}-notify-${Date.now()}`,
+              role: 'status',
+              content: `${level}: ${stripAnsi(message)}`,
+              timestamp: Date.now()
+            }]
+          } : session);
+        });
+        const editorTextCleanup = await listen<EditorTextEvent>('pi://editor-text', (event) => {
+          if (activeSession && event.payload.session_id === activeSession.id) {
+            draft = event.payload.text;
+          }
+        });
         if (disposed) {
           messageCleanup();
           sessionCleanup();
           extensionCleanup();
+          statusCleanup();
+          widgetCleanup();
+          notifyCleanup();
+          editorTextCleanup();
           return;
         }
-        unlisteners = [messageCleanup, sessionCleanup, extensionCleanup];
+        unlisteners = [messageCleanup, sessionCleanup, extensionCleanup, statusCleanup, widgetCleanup, notifyCleanup, editorTextCleanup];
         await refreshSessions();
         if (sessions.length === 0) await createSession();
       } catch (err) {
@@ -433,7 +590,7 @@
     return () => {
       disposed = true;
       unlisteners.forEach((unlisten) => unlisten());
-      window.removeEventListener('keydown', handleZoomShortcut);
+      window.removeEventListener('keydown', handleGlobalKeydown);
       detachInteractions();
       animationScope?.revert();
     };
@@ -457,6 +614,16 @@
     <header class="topbar">
       <div class="crumbs"><span>workspace</span><strong>{activeProjectName}</strong><em>{active.label}</em></div>
       <div class="topbar-actions">
+        {#if activeSession}
+          <button
+            class="preset-chip preset-{activePreset ?? 'off'}"
+            on:click={() => cyclePrimary(1)}
+            title="Cycle plan → build → ask → off (Shift+Tab in prompt)"
+            aria-label="Cycle primary preset"
+          >
+            <small>primary</small><strong>{activePreset ?? 'off'}</strong>
+          </button>
+        {/if}
         <span class="pi-state" class:streaming={activeSession?.status === 'streaming'}>Pi: {activeSession?.status ?? 'offline'}</span>
         <button class="text-button" on:click={pickProjectAndCreate}>Open folder</button>
         <button class="solid-button" on:click={() => createSession()}>New session</button>
@@ -600,14 +767,34 @@
           </section>
         {/if}
 
-        {#if visibleCommands.length}
+        {#if draft.startsWith('/')}
           <section class="slash-menu panel" aria-label="Pi slash commands">
-            {#each visibleCommands as command}
-              <button on:click={() => chooseCommand(command)}>
-                <strong>/{command.name}</strong>
-                <small>{command.description} · {command.source}</small>
-              </button>
-            {/each}
+            {#if visibleCommands.length}
+              {#each visibleCommands as command}
+                <button on:click={() => chooseCommand(command)}>
+                  <strong>/{command.name}</strong>
+                  <small>
+                    {command.description || 'no description'}
+                    <em class="cmd-source cmd-{command.source}">{command.source}{command.location ? ` · ${command.location}` : ''}</em>
+                  </small>
+                </button>
+              {/each}
+            {:else}
+              <p class="empty-note">No matching commands. Type to fuzzy-filter.</p>
+            {/if}
+            <button class="slash-refresh" on:click={refreshCommandOptions} type="button">Refresh commands</button>
+          </section>
+        {/if}
+
+        {#if hotkeysOpen}
+          <section class="extension-dialog panel" aria-label="Keyboard shortcuts">
+            <div class="panel-head"><span>Keyboard shortcuts</span><button on:click={() => (hotkeysOpen = false)}>Close</button></div>
+            <ul class="hotkeys-list">
+              <li><kbd>Enter</kbd> Send prompt</li>
+              <li><kbd>/</kbd> Open command palette</li>
+              <li><kbd>Ctrl/⌘ +</kbd> / <kbd>Ctrl/⌘ -</kbd> Zoom in/out</li>
+              <li><kbd>Ctrl/⌘ 0</kbd> Reset zoom</li>
+            </ul>
           </section>
         {/if}
 
@@ -631,11 +818,33 @@
           </section>
         {/if}
 
+        {#if activePane === 'chat' && (nonPresetStatuses.length || aboveWidgets.length)}
+          <div class="pi-status-feed">
+            {#if nonPresetStatuses.length}
+              <div class="status-row">
+                {#each nonPresetStatuses as status}
+                  <span class="status-chip"><small>{status.key}</small><strong>{stripAnsi(status.text).trim()}</strong></span>
+                {/each}
+              </div>
+            {/if}
+            {#each aboveWidgets as widget (widget.key)}
+              <pre class="pi-widget" aria-label={`pi widget ${widget.key}`}>{widget.lines.map(stripAnsi).join('\n')}</pre>
+            {/each}
+          </div>
+        {/if}
+
         <div class="command-dock">
           <label for="prompt-input">Prompt</label>
           <input id="prompt-input" bind:value={draft} placeholder={activeSession ? `Ask Pi in ${activeSession.name}…` : 'Create a session first…'} on:input={ensureCommandOptions} on:keydown={(event) => event.key === 'Enter' && send()} />
           <button on:click={send}>Send</button>
         </div>
+        {#if activePane === 'chat' && belowWidgets.length}
+          <div class="pi-status-feed below">
+            {#each belowWidgets as widget (widget.key)}
+              <pre class="pi-widget" aria-label={`pi widget ${widget.key}`}>{widget.lines.map(stripAnsi).join('\n')}</pre>
+            {/each}
+          </div>
+        {/if}
         {#if error}<p class="error">{error}</p>{/if}
       </section>
 

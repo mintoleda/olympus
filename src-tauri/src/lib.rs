@@ -8,9 +8,11 @@ use std::{
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
         atomic::{AtomicU64, Ordering},
+        mpsc::{sync_channel, SyncSender},
         Arc, Mutex,
     },
     thread,
+    time::Duration,
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -64,12 +66,76 @@ struct PiCommandOption {
     name: String,
     description: String,
     source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    location: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
 }
+
+const BUILTIN_COMMANDS: &[(&str, &str)] = &[
+    ("model", "Switch model"),
+    ("scoped-models", "Enable/disable models for cycling"),
+    ("settings", "Open settings"),
+    ("hotkeys", "Show keyboard shortcuts"),
+    ("new", "Start a new session"),
+    ("resume", "Resume a session"),
+    ("tree", "Navigate session tree"),
+    ("compact", "Compact session context"),
+    ("name", "Set session display name"),
+    ("session", "Show session info"),
+    ("login", "Configure provider authentication"),
+    ("logout", "Remove provider authentication"),
+    ("quit", "Exit pi"),
+];
 
 #[derive(Clone, Serialize)]
 struct ExtensionUiRequest {
     session_id: String,
     request: Value,
+}
+
+#[derive(Clone, Serialize)]
+struct StatusEntry {
+    key: String,
+    text: String,
+}
+
+#[derive(Clone, Serialize)]
+struct StatusEvent {
+    session_id: String,
+    statuses: Vec<StatusEntry>,
+}
+
+#[derive(Clone, Serialize)]
+struct WidgetEntry {
+    key: String,
+    lines: Vec<String>,
+    placement: String,
+}
+
+#[derive(Clone, Serialize)]
+struct WidgetEvent {
+    session_id: String,
+    widgets: Vec<WidgetEntry>,
+}
+
+#[derive(Clone, Serialize)]
+struct NotifyEvent {
+    session_id: String,
+    message: String,
+    level: String,
+}
+
+#[derive(Clone, Serialize)]
+struct TitleEvent {
+    session_id: String,
+    title: String,
+}
+
+#[derive(Clone, Serialize)]
+struct EditorTextEvent {
+    session_id: String,
+    text: String,
 }
 
 #[derive(Clone)]
@@ -84,6 +150,10 @@ struct SessionStore {
     runtimes: Mutex<HashMap<String, RunningSession>>,
     active: Mutex<Option<String>>,
     counter: AtomicU64,
+    pending_commands: Mutex<HashMap<String, SyncSender<Vec<PiCommandOption>>>>,
+    last_commands: Mutex<HashMap<String, Vec<PiCommandOption>>>,
+    session_statuses: Mutex<HashMap<String, Vec<StatusEntry>>>,
+    session_widgets: Mutex<HashMap<String, Vec<WidgetEntry>>>,
 }
 
 fn now_ms() -> u64 {
@@ -303,6 +373,210 @@ fn handle_set_model_response(app: &AppHandle, session_id: &str, data: &Value) {
     emit_updated_session(app, updated_session);
 }
 
+fn parse_commands(event: &Value) -> Vec<PiCommandOption> {
+    let Some(items) = event.pointer("/data/commands").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            let name = item.get("name").and_then(Value::as_str)?.to_string();
+            Some(PiCommandOption {
+                name,
+                description: item
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                source: item
+                    .get("source")
+                    .and_then(Value::as_str)
+                    .unwrap_or("extension")
+                    .to_string(),
+                location: item
+                    .get("location")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                path: item
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            })
+        })
+        .collect()
+}
+
+fn handle_commands_response(app: &AppHandle, session_id: &str, event: &Value) {
+    let commands = parse_commands(event);
+    let store = app.state::<SessionStore>();
+    if let Ok(mut cache) = store.last_commands.lock() {
+        cache.insert(session_id.to_string(), commands.clone());
+    }
+    let request_id = event.get("id").and_then(Value::as_str).map(str::to_string);
+    if let Some(request_id) = request_id {
+        let sender = store
+            .pending_commands
+            .lock()
+            .ok()
+            .and_then(|mut map| map.remove(&request_id));
+        if let Some(sender) = sender {
+            let _ = sender.try_send(commands);
+        }
+    }
+}
+
+fn merge_with_builtins(commands: Vec<PiCommandOption>) -> Vec<PiCommandOption> {
+    let mut merged: Vec<PiCommandOption> = BUILTIN_COMMANDS
+        .iter()
+        .map(|(name, description)| PiCommandOption {
+            name: (*name).to_string(),
+            description: (*description).to_string(),
+            source: "builtin".into(),
+            location: None,
+            path: None,
+        })
+        .collect();
+    for command in commands {
+        if let Some(existing) = merged.iter_mut().find(|item| item.name == command.name) {
+            *existing = command;
+        } else {
+            merged.push(command);
+        }
+    }
+    merged.sort_by(|a, b| a.name.cmp(&b.name));
+    merged
+}
+
+fn emit_statuses(app: &AppHandle, session_id: &str, statuses: Vec<StatusEntry>) {
+    let _ = app.emit(
+        "pi://status",
+        StatusEvent {
+            session_id: session_id.to_string(),
+            statuses,
+        },
+    );
+}
+
+fn emit_widgets(app: &AppHandle, session_id: &str, widgets: Vec<WidgetEntry>) {
+    let _ = app.emit(
+        "pi://widget",
+        WidgetEvent {
+            session_id: session_id.to_string(),
+            widgets,
+        },
+    );
+}
+
+fn handle_set_status(app: &AppHandle, session_id: &str, event: &Value) {
+    let key = match event.get("statusKey").and_then(Value::as_str) {
+        Some(key) if !key.is_empty() => key.to_string(),
+        _ => return,
+    };
+    let text = event
+        .get("statusText")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let snapshot = {
+        let store = app.state::<SessionStore>();
+        let mut map = match store.session_statuses.lock() {
+            Ok(map) => map,
+            Err(_) => return,
+        };
+        let entries = map.entry(session_id.to_string()).or_default();
+        entries.retain(|entry| entry.key != key);
+        if let Some(text) = text {
+            entries.push(StatusEntry { key, text });
+        }
+        entries.clone()
+    };
+    emit_statuses(app, session_id, snapshot);
+}
+
+fn handle_set_widget(app: &AppHandle, session_id: &str, event: &Value) {
+    let key = match event.get("widgetKey").and_then(Value::as_str) {
+        Some(key) if !key.is_empty() => key.to_string(),
+        _ => return,
+    };
+    let lines = event.get("widgetLines").and_then(Value::as_array).map(|arr| {
+        arr.iter()
+            .map(|line| line.as_str().unwrap_or("").to_string())
+            .collect::<Vec<_>>()
+    });
+    let placement = event
+        .get("widgetPlacement")
+        .and_then(Value::as_str)
+        .unwrap_or("aboveEditor")
+        .to_string();
+    let snapshot = {
+        let store = app.state::<SessionStore>();
+        let mut map = match store.session_widgets.lock() {
+            Ok(map) => map,
+            Err(_) => return,
+        };
+        let entries = map.entry(session_id.to_string()).or_default();
+        entries.retain(|entry| entry.key != key);
+        if let Some(lines) = lines {
+            entries.push(WidgetEntry { key, lines, placement });
+        }
+        entries.clone()
+    };
+    emit_widgets(app, session_id, snapshot);
+}
+
+fn handle_notify(app: &AppHandle, session_id: &str, event: &Value) {
+    let message = event
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if message.is_empty() {
+        return;
+    }
+    let level = event
+        .get("notifyType")
+        .and_then(Value::as_str)
+        .unwrap_or("info")
+        .to_string();
+    let _ = app.emit(
+        "pi://notify",
+        NotifyEvent {
+            session_id: session_id.to_string(),
+            message,
+            level,
+        },
+    );
+}
+
+fn handle_set_title(app: &AppHandle, session_id: &str, event: &Value) {
+    let title = event
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let _ = app.emit(
+        "pi://title",
+        TitleEvent {
+            session_id: session_id.to_string(),
+            title,
+        },
+    );
+}
+
+fn handle_set_editor_text(app: &AppHandle, session_id: &str, event: &Value) {
+    let text = event
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let _ = app.emit(
+        "pi://editor-text",
+        EditorTextEvent {
+            session_id: session_id.to_string(),
+            text,
+        },
+    );
+}
+
 fn handle_state_response(app: &AppHandle, session_id: &str, data: &Value) {
     let pi_session_id = value_string(data.get("sessionId").or_else(|| data.get("session_id")));
     let pi_session_file =
@@ -457,6 +731,10 @@ fn spawn_pi_inner(
                         if let Some(data) = event.get("data") {
                             handle_set_model_response(&reader_app, &reader_session_id, data);
                         }
+                    } else if event.get("command").and_then(Value::as_str) == Some("get_commands")
+                        && event.get("success").and_then(Value::as_bool) == Some(true)
+                    {
+                        handle_commands_response(&reader_app, &reader_session_id, &event);
                     } else if event.get("success").and_then(Value::as_bool) == Some(false) {
                         let text = event
                             .get("error")
@@ -479,18 +757,36 @@ fn spawn_pi_inner(
                         .get("method")
                         .and_then(Value::as_str)
                         .unwrap_or_default();
-                    if matches!(method, "select" | "confirm" | "input") {
-                        let mut request = event.clone();
-                        if let Some(object) = request.as_object_mut() {
-                            object.remove("type");
+                    match method {
+                        "select" | "confirm" | "input" | "editor" => {
+                            let mut request = event.clone();
+                            if let Some(object) = request.as_object_mut() {
+                                object.remove("type");
+                            }
+                            let _ = reader_app.emit(
+                                "pi://extension-ui-request",
+                                ExtensionUiRequest {
+                                    session_id: reader_session_id.clone(),
+                                    request,
+                                },
+                            );
                         }
-                        let _ = reader_app.emit(
-                            "pi://extension-ui-request",
-                            ExtensionUiRequest {
-                                session_id: reader_session_id.clone(),
-                                request,
-                            },
-                        );
+                        "setStatus" => {
+                            handle_set_status(&reader_app, &reader_session_id, &event);
+                        }
+                        "setWidget" => {
+                            handle_set_widget(&reader_app, &reader_session_id, &event);
+                        }
+                        "notify" => {
+                            handle_notify(&reader_app, &reader_session_id, &event);
+                        }
+                        "setTitle" => {
+                            handle_set_title(&reader_app, &reader_session_id, &event);
+                        }
+                        "set_editor_text" => {
+                            handle_set_editor_text(&reader_app, &reader_session_id, &event);
+                        }
+                        _ => {}
                     }
                 }
                 Some("agent_start") => {
@@ -676,7 +972,30 @@ fn switch_session(
         .active
         .lock()
         .map_err(|_| "active session lock poisoned")? = Some(id.clone());
+    let cached_statuses = store
+        .session_statuses
+        .lock()
+        .ok()
+        .and_then(|map| map.get(&id).cloned())
+        .unwrap_or_default();
+    emit_statuses(&app, &id, cached_statuses);
+    let cached_widgets = store
+        .session_widgets
+        .lock()
+        .ok()
+        .and_then(|map| map.get(&id).cloned())
+        .unwrap_or_default();
+    emit_widgets(&app, &id, cached_widgets);
     spawn_pi_unit(app, id)
+}
+
+#[tauri::command]
+fn send_pi_command(id: String, content: String, app: AppHandle) -> Result<(), String> {
+    let runtime = spawn_pi(app, id.clone())?;
+    write_rpc(
+        &runtime,
+        serde_json::json!({"id": format!("{id}-cmd-{}", now_ms()), "type": "prompt", "message": content}),
+    )
 }
 
 #[tauri::command]
@@ -774,68 +1093,49 @@ fn set_pi_thinking_level(id: String, level: String, app: AppHandle) -> Result<()
 
 #[tauri::command]
 fn list_pi_commands(id: String, app: AppHandle) -> Result<Vec<PiCommandOption>, String> {
-    let runtime = spawn_pi_inner(app, id.clone(), false)?;
-    write_rpc(
+    let runtime = spawn_pi_inner(app.clone(), id.clone(), false)?;
+    let request_id = format!("{id}-commands-{}", now_ms());
+
+    let (tx, rx) = sync_channel::<Vec<PiCommandOption>>(1);
+    {
+        let store = app.state::<SessionStore>();
+        let mut pending = store
+            .pending_commands
+            .lock()
+            .map_err(|_| "pending commands lock poisoned")?;
+        pending.insert(request_id.clone(), tx);
+    }
+
+    let write_result = write_rpc(
         &runtime,
-        serde_json::json!({"id": format!("{id}-commands-{}", now_ms()), "type": "get_commands"}),
-    )?;
-    Ok(vec![
-        PiCommandOption {
-            name: "model".into(),
-            description: "Select model".into(),
-            source: "builtin".into(),
-        },
-        PiCommandOption {
-            name: "settings".into(),
-            description: "Open settings".into(),
-            source: "builtin".into(),
-        },
-        PiCommandOption {
-            name: "scoped-models".into(),
-            description: "Enable/disable models for cycling".into(),
-            source: "builtin".into(),
-        },
-        PiCommandOption {
-            name: "compact".into(),
-            description: "Compact session context".into(),
-            source: "builtin".into(),
-        },
-        PiCommandOption {
-            name: "name".into(),
-            description: "Set session display name".into(),
-            source: "builtin".into(),
-        },
-        PiCommandOption {
-            name: "session".into(),
-            description: "Show session info".into(),
-            source: "builtin".into(),
-        },
-        PiCommandOption {
-            name: "new".into(),
-            description: "Start a new session".into(),
-            source: "builtin".into(),
-        },
-        PiCommandOption {
-            name: "resume".into(),
-            description: "Resume a session".into(),
-            source: "builtin".into(),
-        },
-        PiCommandOption {
-            name: "tree".into(),
-            description: "Navigate session tree".into(),
-            source: "builtin".into(),
-        },
-        PiCommandOption {
-            name: "login".into(),
-            description: "Configure provider authentication".into(),
-            source: "builtin".into(),
-        },
-        PiCommandOption {
-            name: "logout".into(),
-            description: "Remove provider authentication".into(),
-            source: "builtin".into(),
-        },
-    ])
+        serde_json::json!({"id": request_id, "type": "get_commands"}),
+    );
+
+    if let Err(err) = write_result {
+        let store = app.state::<SessionStore>();
+        if let Ok(mut pending) = store.pending_commands.lock() {
+            pending.remove(&request_id);
+        }
+        return Err(err);
+    }
+
+    let commands = match rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(commands) => commands,
+        Err(_) => {
+            let store = app.state::<SessionStore>();
+            if let Ok(mut pending) = store.pending_commands.lock() {
+                pending.remove(&request_id);
+            }
+            store
+                .last_commands
+                .lock()
+                .ok()
+                .and_then(|cache| cache.get(&id).cloned())
+                .unwrap_or_default()
+        }
+    };
+
+    Ok(merge_with_builtins(commands))
 }
 
 #[tauri::command]
@@ -985,7 +1285,8 @@ pub fn run() {
             compact_session,
             rename_pi_session,
             close_session,
-            send_message
+            send_message,
+            send_pi_command
         ])
         .setup(|app| {
             let handle = app.handle().clone();
