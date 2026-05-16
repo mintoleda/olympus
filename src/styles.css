@@ -424,17 +424,6 @@ h1 {
   z-index: 1;
 }
 
-.home-surface::before {
-  content: '';
-  position: absolute;
-  inset: -18% 18% auto auto;
-  width: 340px;
-  height: 340px;
-  border-radius: 50%;
-  background: radial-gradient(circle, rgba(255, 179, 71, 0.22), rgba(185, 107, 55, 0.06) 50%, transparent 68%);
-  filter: blur(2px);
-  pointer-events: none;
-}
 
 .welcome-block {
   position: relative;
@@ -555,9 +544,7 @@ h1 {
   padding: 18px;
   border: 1px solid rgba(255, 179, 71, 0.16);
   border-radius: 28px;
-  background:
-    linear-gradient(180deg, rgba(9, 8, 6, 0.36), rgba(9, 8, 6, 0.18)),
-    repeating-linear-gradient(90deg, rgba(255, 179, 71, 0.055) 0 1px, transparent 1px 28px);
+  background: linear-gradient(180deg, rgba(9, 8, 6, 0.36), rgba(9, 8, 6, 0.18));
 }
 
 .recent-list {
@@ -609,31 +596,8 @@ h1 {
   font-size: 0.65rem;
 }
 
-.orbital-mark {
-  position: absolute;
-  right: 5%;
-  top: 0;
-  width: 170px;
-  height: 170px;
-  border: 1px solid rgba(255, 179, 71, 0.18);
-  border-radius: 50%;
-  opacity: 0.85;
-  pointer-events: none;
-}
-
-.orbital-mark span {
-  position: absolute;
-  inset: 22px;
-  border: 1px solid rgba(255,255,255,0.08);
-  border-radius: 50%;
-}
-
-.orbital-mark span:nth-child(2) { inset: 52px; border-color: rgba(157, 255, 191, 0.18); }
-.orbital-mark span:nth-child(3) { inset: 78px; background: var(--amber); box-shadow: 0 0 32px rgba(255, 179, 71, 0.42); }
-
 @media (max-width: 980px) {
   .home-surface { grid-template-columns: 1fr; overflow: auto; }
   .welcome-block, .recent-card, .home-grid { grid-column: 1; grid-row: auto; }
   .home-grid { grid-template-columns: 1fr; }
-  .orbital-mark { display: none; }
 }

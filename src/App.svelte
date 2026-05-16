@@ -165,13 +165,12 @@
           </div>
         {:else if activePane === 'home'}
           <div class="home-surface">
-            <div class="orbital-mark" aria-hidden="true"><span></span><span></span><span></span></div>
             <section class="welcome-block">
               <p class="kicker">01 / Atrium</p>
-              <h2>Launch Pi without breaking orbit.</h2>
-              <p>Olympus opens on a quiet command deck: resume a project, create a fresh context, or send a prompt and land directly in chat.</p>
+              <h2>Start a focused Pi session.</h2>
+              <p>Olympus gives you a clean place to resume a project, create a fresh context, or send a prompt and move directly into chat.</p>
               <div class="home-actions" aria-label="Home quick actions">
-                <button class="primary-action" on:click={() => (activePane = 'chat')} disabled={!activeSession}>Continue {activeSession?.name ?? 'session'} ↗</button>
+                <button class="primary-action" on:click={() => (activePane = 'chat')} disabled={!activeSession}>Continue where you left off ↗</button>
                 <button on:click={() => createSession()}>New local session</button>
                 <button on:click={pickProjectAndCreate}>Open project folder</button>
               </div>
@@ -188,7 +187,7 @@
             </section>
 
             <section class="recent-card">
-              <div class="panel-head"><span>Recent flight paths</span><small>{recentSessions.length} ready</small></div>
+              <div class="panel-head"><span>Recent sessions</span><small>{recentSessions.length} ready</small></div>
               {#if recentSessions.length}
                 <div class="recent-list">
                   {#each recentSessions as session}
