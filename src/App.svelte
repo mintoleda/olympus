@@ -60,6 +60,7 @@
   let modelFilter = '';
   let rootEl: HTMLElement;
   let chatLogEl: HTMLElement;
+  let zoom = 1;
   let animationScope: Scope | undefined;
   let animationReady = false;
   let lastAnimatedPane: PaneId = activePane;
@@ -230,6 +231,29 @@
     if (ok !== undefined) draft = '';
   }
 
+  function clampZoom(value: number) {
+    return Math.min(1.4, Math.max(0.75, Math.round(value * 100) / 100));
+  }
+
+  function setZoom(value: number) {
+    zoom = clampZoom(value);
+    document.documentElement.style.setProperty('--app-zoom', String(zoom));
+  }
+
+  function handleZoomShortcut(event: KeyboardEvent) {
+    if (!event.ctrlKey && !event.metaKey) return;
+    if (event.key === '+' || event.key === '=') {
+      event.preventDefault();
+      setZoom(zoom + 0.05);
+    } else if (event.key === '-' || event.key === '_') {
+      event.preventDefault();
+      setZoom(zoom - 0.05);
+    } else if (event.key === '0') {
+      event.preventDefault();
+      setZoom(1);
+    }
+  }
+
   async function handleSlashCommand(content: string): Promise<boolean> {
     const [command, ...rest] = content.slice(1).split(/\s+/);
     const args = rest.join(' ').trim();
@@ -320,6 +344,8 @@
   onMount(() => {
     let unlisteners: Array<() => void> = [];
     let disposed = false;
+    setZoom(zoom);
+    window.addEventListener('keydown', handleZoomShortcut);
     const detachInteractions = attachInteractionAnimations(rootEl);
     animationScope = createAppAnimationScope(rootEl);
     animateShellEnter(rootEl, animationScope);
@@ -375,6 +401,7 @@
     return () => {
       disposed = true;
       unlisteners.forEach((unlisten) => unlisten());
+      window.removeEventListener('keydown', handleZoomShortcut);
       detachInteractions();
       animationScope?.revert();
     };
