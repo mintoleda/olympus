@@ -10,11 +10,11 @@
   type SessionEvent = { session_id: string; message: ChatMessage };
 
   const panes: Array<{ id: PaneId; label: string; key: string; description: string }> = [
-    { id: 'home', label: 'Atrium', key: '01', description: 'A calm launch surface for Pi sessions, widgets, and command routing.' },
-    { id: 'chat', label: 'Chat', key: '02', description: 'Live headless Pi conversations grouped by project.' },
-    { id: 'widgets', label: 'Modules', key: '03', description: 'Sandboxed AI tools and local system telemetry.' },
-    { id: 'search', label: 'Index', key: '04', description: 'A future global search plane for files, chats, commands, and widgets.' },
-    { id: 'settings', label: 'Control', key: '05', description: 'Preferences, permissions, theme, layout, and platform details.' }
+    { id: 'home', label: 'Home', key: 'HM', description: 'Resume recent work, open a folder, or start a clean Pi context.' },
+    { id: 'chat', label: 'Sessions', key: 'SE', description: 'Project-bound Pi conversations with local transcript history.' },
+    { id: 'widgets', label: 'Runtime', key: 'RT', description: 'Local tools, process telemetry, and trusted desktop modules.' },
+    { id: 'search', label: 'Find', key: 'FD', description: 'A planned index for sessions, files, commands, and widgets.' },
+    { id: 'settings', label: 'Settings', key: 'ST', description: 'Preferences, permissions, theme, layout, and platform details.' }
   ];
 
   const widgets = [
@@ -39,13 +39,18 @@
   );
   $: recentSessions = [...sessions]
     .sort((a, b) => Math.max(...b.messages.map((message) => message.timestamp), 0) - Math.max(...a.messages.map((message) => message.timestamp), 0))
-    .slice(0, 4);
+    .slice(0, 6);
   $: activeProjectName = activeSession?.project_path.split('/').filter(Boolean).at(-1) ?? 'workspace';
   $: homeStats = [
-    { label: 'Live sessions', value: String(sessions.length).padStart(2, '0'), note: sessions.length === 1 ? 'one context mounted' : 'contexts mounted' },
-    { label: 'Active project', value: activeProjectName, note: activeSession?.status ?? 'waiting' },
-    { label: 'Message trail', value: String(sessions.reduce((count, session) => count + session.messages.length, 0)), note: 'local conversation events' }
+    { label: 'Sessions', value: String(sessions.length).padStart(2, '0'), note: sessions.length === 1 ? 'context mounted' : 'contexts mounted' },
+    { label: 'Project', value: activeProjectName, note: activeSession?.status ?? 'waiting' },
+    { label: 'Events', value: String(sessions.reduce((count, session) => count + session.messages.length, 0)), note: 'local transcript entries' }
   ];
+
+  function formatTime(timestamp: number) {
+    if (!timestamp) return 'no activity';
+    return new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit' }).format(new Date(timestamp));
+  }
 
   async function refreshSessions() {
     sessions = await invoke<PiSession[]>('list_sessions');
@@ -91,8 +96,10 @@
     draft = '';
   }
 
-  onMount(async () => {
-    const unlisten = await listen<SessionEvent>('pi://message', (event) => {
+  onMount(() => {
+    let unlisten: (() => void) | undefined;
+
+    listen<SessionEvent>('pi://message', (event) => {
       const { session_id, message } = event.payload;
       sessions = sessions.map((session) => {
         if (session.id !== session_id) return session;
@@ -111,90 +118,104 @@
         }
         return { ...session, status: message.role === 'assistant' ? 'streaming' : session.status, messages: [...session.messages, message] };
       });
+    }).then((cleanup) => {
+      unlisten = cleanup;
     });
 
-    try {
-      await refreshSessions();
-      if (sessions.length === 0) await createSession();
-    } catch (err) {
-      error = String(err);
-    }
+    (async () => {
+      try {
+        await refreshSessions();
+        if (sessions.length === 0) await createSession();
+      } catch (err) {
+        error = String(err);
+      }
+    })();
 
-    return unlisten;
+    return () => unlisten?.();
   });
 </script>
 
-<main class="observatory">
-  <aside class="spine" aria-label="Primary navigation">
-    <div class="seal"><span>Ω</span><small>Olympus</small></div>
+<main class="ops-shell">
+  <aside class="nav-rail" aria-label="Primary navigation">
+    <div class="product-mark"><span>OL</span><small>Olympus</small></div>
     <nav class="pane-tabs">
       {#each panes as pane}
-        <button class:active={pane.id === activePane} on:click={() => (activePane = pane.id)}><b>{pane.key}</b><span>{pane.label}</span></button>
+        <button class:active={pane.id === activePane} on:click={() => (activePane = pane.id)}>
+          <b>{pane.key}</b><span>{pane.label}</span>
+        </button>
       {/each}
     </nav>
-    <div class="spine-footer"><span class="pulse"></span><p>{sessions.length} Pi sessions</p></div>
+    <div class="rail-status"><span class="status-dot"></span><p>{sessions.length} mounted</p></div>
   </aside>
 
-  <section class="stage">
-    <header class="masthead">
-      <div><p class="kicker">Pi workspace</p><h1>{active.label}</h1></div>
-      <div class="masthead-actions">
-        <button class="ghost-button quiet-ghost" on:click={pickProjectAndCreate}>Open project…</button>
-        <button class="ghost-button primary-ghost" on:click={() => createSession()}>＋ New session</button>
+  <section class="workbench">
+    <header class="topbar">
+      <div class="crumbs"><span>workspace</span><strong>{activeProjectName}</strong><em>{active.label}</em></div>
+      <div class="topbar-actions">
+        <span class="pi-state">Pi: {activeSession?.status ?? 'offline'}</span>
+        <button class="text-button" on:click={pickProjectAndCreate}>Open folder</button>
+        <button class="solid-button" on:click={() => createSession()}>New session</button>
       </div>
     </header>
 
     <div class="layout" class:chat-layout={activePane === 'chat'} class:sessions-collapsed={activePane === 'chat' && sessionsCollapsed}>
       {#if activePane === 'chat'}
         {#if sessionsCollapsed}
-          <button class="sessions-peek panel pane-pop" on:click={() => (sessionsCollapsed = false)} aria-label="Expand sessions tab">
+          <button class="sessions-peek panel" on:click={() => (sessionsCollapsed = false)} aria-label="Expand session list">
             <span>Sessions</span><strong>{sessions.length}</strong>
           </button>
         {:else}
-          <aside class="project-tabs panel pane-pop">
+          <aside class="session-tree panel">
             <div class="panel-head">
-              <button class="panel-title-button" on:click={() => (sessionsCollapsed = true)} aria-label="Minimize sessions tab">Projects</button>
+              <button class="panel-title-button" on:click={() => (sessionsCollapsed = true)} aria-label="Collapse session list">Session stack</button>
               <div class="mini-actions">
-                <button class="quiet-mini" on:click={pickProjectAndCreate}>Open…</button>
+                <button class="quiet-mini" on:click={pickProjectAndCreate}>Open</button>
                 <button on:click={() => createSession()}>New</button>
               </div>
             </div>
-          {#each groupedSessions as [project, projectSessions]}
-            <p class="project-label">{project}</p>
-            {#each projectSessions as session}
-              <button class:chosen={session.id === activeSession?.id} on:click={() => switchSession(session.id)}>
-                <strong>{session.name}</strong><small>{session.project_path}</small><em>{session.status}</em>
-                <span class="close" role="button" tabindex="0" on:click|stopPropagation={() => closeSession(session.id)} on:keydown|stopPropagation={(event) => (event.key === 'Enter' || event.key === ' ') && closeSession(session.id)}>×</span>
-              </button>
+            {#each groupedSessions as [project, projectSessions]}
+              <p class="project-label">{project}</p>
+              {#each projectSessions as session}
+                <button class:chosen={session.id === activeSession?.id} on:click={() => switchSession(session.id)}>
+                  <strong>{session.name}</strong><small>{session.project_path}</small><em>{session.status}</em>
+                  <span class="close" role="button" tabindex="0" on:click|stopPropagation={() => closeSession(session.id)} on:keydown|stopPropagation={(event) => (event.key === 'Enter' || event.key === ' ') && closeSession(session.id)}>×</span>
+                </button>
+              {/each}
             {/each}
-          {/each}
           </aside>
         {/if}
       {/if}
 
-      <section class="hero panel chat-hero" class:home-hero={activePane === 'home'} class:panel-shift={activePane !== 'chat'}>
+      <section class="main-panel panel" class:home-panel={activePane === 'home'}>
         {#if activePane === 'chat' && activeSession}
+          <div class="transcript-head">
+            <div><p class="eyebrow">Active transcript</p><h1>{activeSession.name}</h1></div>
+            <span>{activeSession.status}</span>
+          </div>
           <div class="chat-log">
             {#each activeSession.messages as message, index}
-              <article class="message {message.role}" style={`--i: ${index}`}><span>{message.role}</span><p>{message.content}</p></article>
+              <article class="message {message.role}" style={`--i: ${index}`}>
+                <header><span>{message.role}</span><time>{formatTime(message.timestamp)}</time></header>
+                <p>{message.content}</p>
+              </article>
             {/each}
           </div>
         {:else if activePane === 'home'}
           <div class="home-surface">
-            <section class="welcome-block">
-              <p class="kicker">01 / Atrium</p>
-              <h2>Start a focused Pi session.</h2>
-              <p>Olympus gives you a clean place to resume a project, create a fresh context, or send a prompt and move directly into chat.</p>
+            <section class="launch-card">
+              <p class="eyebrow">Local command center</p>
+              <h1>Pick up the thread without opening another terminal.</h1>
+              <p>Mount a project folder, resume a Pi context, or start a clean session. Olympus keeps the transcript, runtime state, and session stack in one desktop surface.</p>
               <div class="home-actions" aria-label="Home quick actions">
-                <button class="primary-action" on:click={() => (activePane = 'chat')} disabled={!activeSession}>Continue where you left off ↗</button>
+                <button class="primary-action" on:click={() => (activePane = 'chat')} disabled={!activeSession}>Resume active session</button>
                 <button on:click={pickProjectAndCreate}>Open project folder</button>
                 <button on:click={() => createSession()}>New local session</button>
               </div>
             </section>
 
-            <section class="home-grid" aria-label="Workspace overview">
+            <section class="home-metrics" aria-label="Workspace overview">
               {#each homeStats as stat}
-                <article class="home-stat">
+                <article>
                   <span>{stat.label}</span>
                   <strong>{stat.value}</strong>
                   <small>{stat.note}</small>
@@ -203,12 +224,12 @@
             </section>
 
             <section class="recent-card">
-              <div class="panel-head"><span>Recent sessions</span><small>{recentSessions.length} ready</small></div>
+              <div class="panel-head"><span>Recent work</span><small>{recentSessions.length} entries</small></div>
               {#if recentSessions.length}
                 <div class="recent-list">
                   {#each recentSessions as session}
                     <button class:current={session.id === activeSession?.id} on:click={() => openSession(session.id)}>
-                      <span class="session-orb"></span>
+                      <span class="session-dot"></span>
                       <strong>{session.name}</strong>
                       <small>{session.project_path}</small>
                       <em>{session.status}</em>
@@ -221,19 +242,35 @@
             </section>
           </div>
         {:else}
-          <div class="hero-copy hero-enter"><p class="kicker">{active.key} / {active.label}</p><h2>{active.description}</h2><p>Phase 2 adds a real Rust session manager behind this shell. Create, switch, close, and stream independent Pi conversations without leaving the hub.</p></div>
+          <div class="placeholder-copy">
+            <p class="eyebrow">{active.key} / {active.label}</p>
+            <h1>{active.description}</h1>
+            <p>This surface will grow into a practical inspector for Pi, project state, permissions, and local tools. The shell is intentionally quiet until there is real state to show.</p>
+          </div>
         {/if}
 
         <div class="command-dock">
-          <input bind:value={draft} placeholder={activeSession ? `Ask Pi in ${activeSession.name}…` : 'Create a session first…'} on:keydown={(event) => event.key === 'Enter' && send()} />
-          <button on:click={send}>Send ↗</button>
+          <label for="prompt-input">Prompt</label>
+          <input id="prompt-input" bind:value={draft} placeholder={activeSession ? `Ask Pi in ${activeSession.name}…` : 'Create a session first…'} on:keydown={(event) => event.key === 'Enter' && send()} />
+          <button on:click={send}>Send</button>
         </div>
         {#if error}<p class="error">{error}</p>{/if}
       </section>
 
-      <aside class="right-rail">
-        <section class="panel widget-panel"><div class="panel-head"><span>Telemetry</span><small>live mock</small></div><div class="meters">{#each widgets as widget}<article><span>{widget.label}</span><strong>{widget.value}</strong><small>{widget.note}</small></article>{/each}</div></section>
-        <section class="panel permission-card"><p class="kicker">Session model</p><h3>{activeSession?.name ?? 'No session'}</h3><p>{activeSession?.project_path ?? 'Create a project-bound Pi session.'}</p></section>
+      <aside class="inspector">
+        <section class="panel runtime-panel">
+          <div class="panel-head"><span>Runtime</span><small>local</small></div>
+          <div class="meters">
+            {#each widgets as widget}
+              <article><span>{widget.label}</span><strong>{widget.value}</strong><small>{widget.note}</small></article>
+            {/each}
+          </div>
+        </section>
+        <section class="panel context-card">
+          <p class="eyebrow">Context</p>
+          <h2>{activeSession?.name ?? 'No session'}</h2>
+          <p>{activeSession?.project_path ?? 'Create a project-bound Pi session.'}</p>
+        </section>
       </aside>
     </div>
   </section>
