@@ -1,13 +1,17 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::{
     collections::HashMap,
-    path::PathBuf,
+    fs,
     io::{BufRead, BufReader, Write},
-    process::{Command, Stdio},
-    sync::{atomic::{AtomicU64, Ordering}, Mutex},
+    path::PathBuf,
+    process::{Child, ChildStdin, Command, Stdio},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     thread,
 };
-use serde_json::Value;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -26,6 +30,8 @@ struct PiSession {
     status: String,
     messages: Vec<ChatMessage>,
     session_dir: String,
+    pi_session_id: Option<String>,
+    pi_session_file: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -34,9 +40,16 @@ struct SessionEvent {
     message: ChatMessage,
 }
 
+#[derive(Clone)]
+struct RunningSession {
+    child: Arc<Mutex<Child>>,
+    stdin: Arc<Mutex<ChildStdin>>,
+}
+
 #[derive(Default)]
 struct SessionStore {
     sessions: Mutex<HashMap<String, PiSession>>,
+    runtimes: Mutex<HashMap<String, RunningSession>>,
     active: Mutex<Option<String>>,
     counter: AtomicU64,
 }
@@ -57,38 +70,317 @@ fn project_name(path: &str) -> String {
         .to_string()
 }
 
+fn sessions_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app.path().app_data_dir().map_err(|err| err.to_string())?;
+    fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+    Ok(dir.join("sessions.json"))
+}
+
+fn save_sessions(app: &AppHandle, sessions: &HashMap<String, PiSession>) -> Result<(), String> {
+    let path = sessions_path(app)?;
+    let sessions: Vec<_> = sessions.values().cloned().collect();
+    let json = serde_json::to_string_pretty(&sessions).map_err(|err| err.to_string())?;
+    fs::write(path, json).map_err(|err| err.to_string())
+}
+
+fn persist_store(app: &AppHandle, store: &SessionStore) {
+    if let Ok(sessions) = store.sessions.lock() {
+        let _ = save_sessions(app, &sessions);
+    }
+}
+
+fn load_sessions(app: &AppHandle, store: &SessionStore) {
+    let Ok(path) = sessions_path(app) else { return };
+    let Ok(json) = fs::read_to_string(path) else { return };
+    let Ok(sessions) = serde_json::from_str::<Vec<PiSession>>(&json) else { return };
+    if let Ok(mut map) = store.sessions.lock() {
+        for mut session in sessions {
+            session.status = "idle".into();
+            map.insert(session.id.clone(), session);
+        }
+    }
+}
+
+fn emit_message(app: &AppHandle, session_id: &str, message: ChatMessage) {
+    let _ = app.emit(
+        "pi://message",
+        SessionEvent {
+            session_id: session_id.to_string(),
+            message,
+        },
+    );
+}
+
+fn mark_status(app: &AppHandle, session_id: &str, status: &str) {
+    let store = app.state::<SessionStore>();
+    if let Ok(mut sessions) = store.sessions.lock() {
+        if let Some(session) = sessions.get_mut(session_id) {
+            session.status = status.into();
+        }
+        let _ = save_sessions(app, &sessions);
+    }
+    emit_message(
+        app,
+        session_id,
+        ChatMessage {
+            id: format!("{session_id}-status-{}", now_ms()),
+            role: "status".into(),
+            content: status.into(),
+            timestamp: now_ms(),
+        },
+    );
+}
+
+fn append_assistant_delta(app: &AppHandle, session_id: &str, message_id: &str, delta: &str) {
+    emit_message(
+        app,
+        session_id,
+        ChatMessage {
+            id: message_id.into(),
+            role: "assistant".into(),
+            content: delta.into(),
+            timestamp: now_ms(),
+        },
+    );
+}
+
+fn finalize_assistant(app: &AppHandle, session_id: &str, message_id: &str, content: String) {
+    let store = app.state::<SessionStore>();
+    if let Ok(mut sessions) = store.sessions.lock() {
+        if let Some(session) = sessions.get_mut(session_id) {
+            session.messages.push(ChatMessage {
+                id: message_id.into(),
+                role: "assistant".into(),
+                content: if content.trim().is_empty() {
+                    "Pi returned no output.".into()
+                } else {
+                    content
+                },
+                timestamp: now_ms(),
+            });
+            session.status = "idle".into();
+        }
+        let _ = save_sessions(app, &sessions);
+    }
+    emit_message(
+        app,
+        session_id,
+        ChatMessage {
+            id: format!("{session_id}-done-{}", now_ms()),
+            role: "status".into(),
+            content: "idle".into(),
+            timestamp: now_ms(),
+        },
+    );
+}
+
+fn handle_state_response(app: &AppHandle, session_id: &str, data: &Value) {
+    let pi_session_id = data.get("sessionId").and_then(Value::as_str).map(str::to_string);
+    let pi_session_file = data.get("sessionFile").and_then(Value::as_str).map(str::to_string);
+    let session_name = data.get("sessionName").and_then(Value::as_str).map(str::to_string);
+
+    let store = app.state::<SessionStore>();
+    if let Ok(mut sessions) = store.sessions.lock() {
+        if let Some(session) = sessions.get_mut(session_id) {
+            if let Some(id) = pi_session_id {
+                session.pi_session_id = Some(id);
+            }
+            if let Some(file) = pi_session_file {
+                session.pi_session_file = Some(file);
+            }
+            if let Some(name) = session_name {
+                session.name = name;
+            }
+            if session.status == "starting" {
+                session.status = "idle".into();
+            }
+        }
+        let _ = save_sessions(app, &sessions);
+    };
+}
+
+fn spawn_pi(app: AppHandle, session_id: String) -> Result<(), String> {
+    let store = app.state::<SessionStore>();
+    if store
+        .runtimes
+        .lock()
+        .map_err(|_| "runtime store poisoned")?
+        .contains_key(&session_id)
+    {
+        return Ok(());
+    }
+
+    let (project_path, resume_target) = {
+        let mut sessions = store.sessions.lock().map_err(|_| "session store poisoned")?;
+        let session = sessions.get_mut(&session_id).ok_or("session not found")?;
+        session.status = "starting".into();
+        (
+            session.project_path.clone(),
+            session.pi_session_file.clone().or_else(|| session.pi_session_id.clone()),
+        )
+    };
+
+    let mut command = Command::new("pi");
+    command.current_dir(&project_path).arg("--mode").arg("rpc");
+    if let Some(target) = resume_target {
+        command.arg("--session").arg(target);
+    }
+    command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let mut child = command.spawn().map_err(|err| format!("Could not start Pi RPC: {err}"))?;
+    let stdin = child.stdin.take().ok_or("Pi stdin unavailable")?;
+    let stdout = child.stdout.take().ok_or("Pi stdout unavailable")?;
+    let stderr = child.stderr.take();
+
+    let runtime = RunningSession {
+        child: Arc::new(Mutex::new(child)),
+        stdin: Arc::new(Mutex::new(stdin)),
+    };
+
+    store
+        .runtimes
+        .lock()
+        .map_err(|_| "runtime store poisoned")?
+        .insert(session_id.clone(), runtime.clone());
+    persist_store(&app, &store);
+
+    let reader_app = app.clone();
+    let reader_session_id = session_id.clone();
+    thread::spawn(move || {
+        let mut current_message_id = String::new();
+        let mut full_response = String::new();
+        let reader = BufReader::new(stdout);
+
+        for line in reader.lines().map_while(Result::ok) {
+            let Ok(event) = serde_json::from_str::<Value>(&line) else { continue };
+            match event.get("type").and_then(Value::as_str) {
+                Some("response") => {
+                    if event.get("command").and_then(Value::as_str) == Some("get_state") {
+                        if let Some(data) = event.get("data") {
+                            handle_state_response(&reader_app, &reader_session_id, data);
+                        }
+                    } else if event.get("success").and_then(Value::as_bool) == Some(false) {
+                        let text = event
+                            .get("error")
+                            .map(Value::to_string)
+                            .unwrap_or_else(|| "Pi rejected command".into());
+                        emit_message(
+                            &reader_app,
+                            &reader_session_id,
+                            ChatMessage {
+                                id: format!("{reader_session_id}-err-{}", now_ms()),
+                                role: "assistant".into(),
+                                content: text,
+                                timestamp: now_ms(),
+                            },
+                        );
+                    }
+                }
+                Some("agent_start") => {
+                    current_message_id = format!("{reader_session_id}-a-{}", now_ms());
+                    full_response.clear();
+                    mark_status(&reader_app, &reader_session_id, "streaming");
+                }
+                Some("message_update") => {
+                    let delta_event = &event["assistantMessageEvent"];
+                    if delta_event.get("type").and_then(Value::as_str) == Some("text_delta") {
+                        if let Some(delta) = delta_event.get("delta").and_then(Value::as_str) {
+                            if current_message_id.is_empty() {
+                                current_message_id = format!("{reader_session_id}-a-{}", now_ms());
+                            }
+                            full_response.push_str(delta);
+                            append_assistant_delta(&reader_app, &reader_session_id, &current_message_id, delta);
+                        }
+                    }
+                }
+                Some("agent_end") => {
+                    if current_message_id.is_empty() {
+                        current_message_id = format!("{reader_session_id}-a-{}", now_ms());
+                    }
+                    finalize_assistant(&reader_app, &reader_session_id, &current_message_id, full_response.clone());
+                    current_message_id.clear();
+                    full_response.clear();
+                }
+                _ => {}
+            }
+        }
+
+        let store = reader_app.state::<SessionStore>();
+        if let Ok(mut runtimes) = store.runtimes.lock() {
+            runtimes.remove(&reader_session_id);
+        }
+        mark_status(&reader_app, &reader_session_id, "idle");
+    });
+
+    if let Some(stderr) = stderr {
+        let err_app = app.clone();
+        let err_session_id = session_id.clone();
+        thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                if !line.trim().is_empty() {
+                    eprintln!("pi[{err_session_id}]: {line}");
+                }
+            }
+            let _ = err_app;
+        });
+    }
+
+    {
+        let mut stdin = runtime.stdin.lock().map_err(|_| "Pi stdin lock poisoned")?;
+        let request = serde_json::json!({"id": format!("{session_id}-state-{}", now_ms()), "type": "get_state"});
+        writeln!(stdin, "{request}").map_err(|err| err.to_string())?;
+        stdin.flush().map_err(|err| err.to_string())?;
+    }
+
+    Ok(())
+}
+
 #[tauri::command]
-fn create_session(project_path: Option<String>, store: State<'_, SessionStore>) -> Result<PiSession, String> {
+fn create_session(project_path: Option<String>, app: AppHandle, store: State<'_, SessionStore>) -> Result<PiSession, String> {
     let id_num = store.counter.fetch_add(1, Ordering::Relaxed) + 1;
-    let project_path = project_path.unwrap_or_else(|| std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_else(|_| "~".into()));
+    let project_path = project_path.unwrap_or_else(|| {
+        std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "~".into())
+    });
     let id = format!("session-{id_num}");
-    let session_dir = String::new();
     let session = PiSession {
         id: id.clone(),
         name: project_name(&project_path),
         project_path,
-        status: "active".into(),
+        status: "starting".into(),
         messages: vec![ChatMessage {
             id: format!("session-{id_num}-hello"),
             role: "assistant".into(),
-            content: "Real Pi session ready. Olympus is using your normal `$HOME/.pi` config and session storage.".into(),
+            content: "Pi session ready. Olympus will resume this conversation by its Pi session id.".into(),
             timestamp: now_ms(),
         }],
-        session_dir,
+        session_dir: String::new(),
+        pi_session_id: None,
+        pi_session_file: None,
     };
 
-    store.sessions.lock().map_err(|_| "session store poisoned")?.insert(session.id.clone(), session.clone());
+    {
+        let mut sessions = store.sessions.lock().map_err(|_| "session store poisoned")?;
+        sessions.insert(session.id.clone(), session.clone());
+        save_sessions(&app, &sessions)?;
+    }
     *store.active.lock().map_err(|_| "active session lock poisoned")? = Some(session.id.clone());
+    spawn_pi(app, session.id.clone())?;
     Ok(session)
 }
 
 #[tauri::command]
-fn list_sessions(store: State<'_, SessionStore>) -> Result<Vec<PiSession>, String> {
+fn list_sessions(app: AppHandle, store: State<'_, SessionStore>) -> Result<Vec<PiSession>, String> {
+    if store.sessions.lock().map_err(|_| "session store poisoned")?.is_empty() {
+        load_sessions(&app, &store);
+    }
+
     let mut sessions: Vec<_> = store.sessions.lock().map_err(|_| "session store poisoned")?.values().cloned().collect();
     let active = store.active.lock().map_err(|_| "active session lock poisoned")?.clone();
     sessions.sort_by(|a, b| a.project_path.cmp(&b.project_path).then(a.name.cmp(&b.name)));
     for session in &mut sessions {
-        if session.status != "streaming" {
+        if session.status != "streaming" && session.status != "starting" && session.status != "error" {
             session.status = if Some(&session.id) == active.as_ref() { "active" } else { "idle" }.into();
         }
     }
@@ -96,152 +388,72 @@ fn list_sessions(store: State<'_, SessionStore>) -> Result<Vec<PiSession>, Strin
 }
 
 #[tauri::command]
-fn switch_session(id: String, store: State<'_, SessionStore>) -> Result<(), String> {
+fn switch_session(id: String, app: AppHandle, store: State<'_, SessionStore>) -> Result<(), String> {
     if !store.sessions.lock().map_err(|_| "session store poisoned")?.contains_key(&id) {
         return Err("session not found".into());
     }
-    *store.active.lock().map_err(|_| "active session lock poisoned")? = Some(id);
-    Ok(())
+    *store.active.lock().map_err(|_| "active session lock poisoned")? = Some(id.clone());
+    spawn_pi(app, id)
 }
 
 #[tauri::command]
-fn close_session(id: String, store: State<'_, SessionStore>) -> Result<(), String> {
-    store.sessions.lock().map_err(|_| "session store poisoned")?.remove(&id);
+fn close_session(id: String, app: AppHandle, store: State<'_, SessionStore>) -> Result<(), String> {
+    if let Some(runtime) = store.runtimes.lock().map_err(|_| "runtime store poisoned")?.remove(&id) {
+        if let Ok(mut child) = runtime.child.lock() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+    if let Ok(mut sessions) = store.sessions.lock() {
+        if let Some(session) = sessions.get_mut(&id) {
+            session.status = "idle".into();
+        }
+        save_sessions(&app, &sessions)?;
+    }
     let mut active = store.active.lock().map_err(|_| "active session lock poisoned")?;
-    if active.as_ref() == Some(&id) { *active = None; }
+    if active.as_ref() == Some(&id) {
+        *active = None;
+    }
     Ok(())
 }
 
 #[tauri::command]
 fn send_message(id: String, content: String, app: AppHandle, store: State<'_, SessionStore>) -> Result<(), String> {
-    let user_message = ChatMessage { id: format!("{id}-u-{}", now_ms()), role: "user".into(), content: content.clone(), timestamp: now_ms() };
-    let (project_path, should_continue) = {
+    if !store.runtimes.lock().map_err(|_| "runtime store poisoned")?.contains_key(&id) {
+        spawn_pi(app.clone(), id.clone())?;
+    }
+
+    let user_message = ChatMessage {
+        id: format!("{id}-u-{}", now_ms()),
+        role: "user".into(),
+        content: content.clone(),
+        timestamp: now_ms(),
+    };
+
+    {
         let mut sessions = store.sessions.lock().map_err(|_| "session store poisoned")?;
         let session = sessions.get_mut(&id).ok_or("session not found")?;
-        let should_continue = session.messages.iter().any(|message| message.role == "user");
+        if session.status == "streaming" {
+            return Err("session is already streaming".into());
+        }
         session.messages.push(user_message.clone());
         session.status = "streaming".into();
-        (session.project_path.clone(), should_continue)
-    };
-    let _ = app.emit("pi://message", SessionEvent { session_id: id.clone(), message: user_message });
+        save_sessions(&app, &sessions)?;
+    }
+    emit_message(&app, &id, user_message);
 
-    thread::spawn(move || {
-        let mut command = Command::new("bash");
-        let pi_command = if should_continue {
-            "exec pi --mode rpc --continue"
-        } else {
-            "exec pi --mode rpc"
-        };
-        command
-            .current_dir(&project_path)
-            .arg("-lc")
-            .arg(pi_command)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+    let runtime = store
+        .runtimes
+        .lock()
+        .map_err(|_| "runtime store poisoned")?
+        .get(&id)
+        .cloned()
+        .ok_or("session process not running")?;
 
-        let mut child = match command.spawn() {
-            Ok(child) => child,
-            Err(err) => {
-                let message = ChatMessage {
-                    id: format!("{id}-a-{}", now_ms()),
-                    role: "assistant".into(),
-                    content: format!("Could not start shell for Pi RPC.\n{err}"),
-                    timestamp: now_ms(),
-                };
-                let _ = app.emit("pi://message", SessionEvent { session_id: id.clone(), message });
-                return;
-            }
-        };
-
-        let mut rpc_stdin = child.stdin.take();
-        if let Some(stdin) = rpc_stdin.as_mut() {
-            let request = serde_json::json!({"id": format!("{id}-prompt-{}", now_ms()), "type": "prompt", "message": content});
-            let _ = writeln!(stdin, "{}", request);
-            let _ = stdin.flush();
-        }
-
-        let mut full_response = String::new();
-        let mut saw_agent_end = false;
-        let assistant_message_id = format!("{id}-a-{}", now_ms());
-        if let Some(stdout) = child.stdout.take() {
-            let reader = BufReader::new(stdout);
-            for line in reader.lines().map_while(Result::ok) {
-                let Ok(event) = serde_json::from_str::<Value>(&line) else { continue };
-                match event.get("type").and_then(Value::as_str) {
-                    Some("message_update") => {
-                        let delta_event = &event["assistantMessageEvent"];
-                        let kind = delta_event.get("type").and_then(Value::as_str).unwrap_or("");
-                        if kind == "text_delta" {
-                            if let Some(delta) = delta_event.get("delta").and_then(Value::as_str) {
-                                full_response.push_str(delta);
-                                let message = ChatMessage {
-                                    id: assistant_message_id.clone(),
-                                    role: "assistant".into(),
-                                    content: delta.to_string(),
-                                    timestamp: now_ms(),
-                                };
-                                let _ = app.emit("pi://message", SessionEvent { session_id: id.clone(), message });
-                            }
-                        }
-                    }
-                    Some("agent_end") => {
-                        saw_agent_end = true;
-                        break;
-                    }
-                    Some("response") if event.get("success").and_then(Value::as_bool) == Some(false) => {
-                        let text = event.get("error").map(Value::to_string).unwrap_or_else(|| "Pi rejected prompt".into());
-                        let message = ChatMessage {
-                            id: assistant_message_id.clone(),
-                            role: "assistant".into(),
-                            content: text,
-                            timestamp: now_ms(),
-                        };
-                        let _ = app.emit("pi://message", SessionEvent { session_id: id.clone(), message });
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        drop(rpc_stdin);
-        let _ = child.kill();
-        let status = child.wait();
-        if !saw_agent_end {
-            if let Ok(exit) = status {
-                if !exit.success() {
-                    if let Some(stderr) = child.stderr.take() {
-                        let mut err_text = String::new();
-                        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                            err_text.push_str(&line);
-                            err_text.push('\n');
-                        }
-                        let message = ChatMessage {
-                            id: format!("{id}-err-{}", now_ms()),
-                            role: "assistant".into(),
-                            content: format!("Pi exited before completing ({exit}).\n{}", err_text.trim()),
-                            timestamp: now_ms(),
-                        };
-                        let _ = app.emit("pi://message", SessionEvent { session_id: id.clone(), message });
-                    }
-                }
-            }
-        }
-
-        let store = app.state::<SessionStore>();
-        if let Ok(mut sessions) = store.sessions.lock() {
-            if let Some(session) = sessions.get_mut(&id) {
-                if full_response.trim().is_empty() {
-                    session.messages.push(ChatMessage { id: assistant_message_id, role: "assistant".into(), content: "Pi returned no output.".into(), timestamp: now_ms() });
-                } else {
-                    session.messages.push(ChatMessage { id: assistant_message_id, role: "assistant".into(), content: full_response, timestamp: now_ms() });
-                }
-                session.status = "idle".into();
-            }
-        }
-        let done = ChatMessage { id: format!("{id}-done-{}", now_ms()), role: "status".into(), content: "done".into(), timestamp: now_ms() };
-        let _ = app.emit("pi://message", SessionEvent { session_id: id, message: done });
-    });
+    let mut stdin = runtime.stdin.lock().map_err(|_| "Pi stdin lock poisoned")?;
+    let request = serde_json::json!({"id": format!("{id}-prompt-{}", now_ms()), "type": "prompt", "message": content});
+    writeln!(stdin, "{request}").map_err(|err| err.to_string())?;
+    stdin.flush().map_err(|err| err.to_string())?;
     Ok(())
 }
 
@@ -252,6 +464,12 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(SessionStore::default())
         .invoke_handler(tauri::generate_handler![create_session, list_sessions, switch_session, close_session, send_message])
+        .setup(|app| {
+            let handle = app.handle().clone();
+            let store = handle.state::<SessionStore>();
+            load_sessions(&handle, &store);
+            Ok(())
+        })
         .run(tauri::generate_context!())
         .expect("error while running olympus");
 }
