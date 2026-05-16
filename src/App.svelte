@@ -37,6 +37,8 @@
   type SessionEvent = { session_id: string; message: ChatMessage };
   type SessionUpdateEvent = { session: PiSession };
   type PiModelOption = { provider: string; id: string; context: string; max_output: string; reasoning: boolean; images: boolean };
+  type PiCommandOption = { name: string; description: string; source: string };
+  type ExtensionUiRequest = { session_id: string; request: Record<string, any> };
   type ConfigChooser = 'provider' | 'model' | 'thinking' | null;
 
   const thinkingLevels = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh'];
@@ -58,6 +60,8 @@
   let modelOptions: PiModelOption[] = [];
   let modelLoading = false;
   let modelFilter = '';
+  let commandOptions: PiCommandOption[] = [];
+  let extensionRequest: ExtensionUiRequest | null = null;
   let rootEl: HTMLElement;
   let chatLogEl: HTMLElement;
   let zoom = 1;
@@ -103,6 +107,10 @@
   $: filteredModels = activeProviderModels
     .filter((model) => !modelSearch || model.id.toLowerCase().includes(modelSearch))
     .slice(0, 160);
+  $: commandSearch = draft.startsWith('/') ? draft.slice(1).toLowerCase() : '';
+  $: visibleCommands = draft.startsWith('/')
+    ? commandOptions.filter((command) => command.name.toLowerCase().includes(commandSearch)).slice(0, 12)
+    : [];
   $: homeStats = [
     { label: 'Sessions', value: String(sessions.length).padStart(2, '0'), note: sessions.length === 1 ? 'context mounted' : 'contexts mounted' },
     { label: 'Project', value: activeProjectName, note: activeSession?.status ?? 'waiting' },
@@ -297,6 +305,26 @@
     }
   }
 
+  async function ensureCommandOptions() {
+    if (!activeSession || commandOptions.length) return;
+    const commands = await runAction(() => invoke<PiCommandOption[]>('list_pi_commands', { id: activeSession!.id }));
+    if (commands) commandOptions = commands;
+  }
+
+  function chooseCommand(command: PiCommandOption) {
+    draft = `/${command.name}${command.name === 'name' || command.name === 'compact' ? ' ' : ''}`;
+  }
+
+  async function respondToExtensionRequest(response: Record<string, any>) {
+    if (!extensionRequest) return;
+    await runAction(() => invoke('respond_extension_ui', {
+      id: extensionRequest!.session_id,
+      requestId: extensionRequest!.request.id,
+      response
+    }));
+    extensionRequest = null;
+  }
+
   async function ensureModelOptions() {
     if (!activeSession || modelLoading || modelOptions.length) return;
     modelLoading = true;
@@ -385,12 +413,16 @@
             : [...sessions, updated];
           if (!activeSessionId) activeSessionId = updated.id;
         });
+        const extensionCleanup = await listen<ExtensionUiRequest>('pi://extension-ui-request', (event) => {
+          extensionRequest = event.payload;
+        });
         if (disposed) {
           messageCleanup();
           sessionCleanup();
+          extensionCleanup();
           return;
         }
-        unlisteners = [messageCleanup, sessionCleanup];
+        unlisteners = [messageCleanup, sessionCleanup, extensionCleanup];
         await refreshSessions();
         if (sessions.length === 0) await createSession();
       } catch (err) {
@@ -568,9 +600,40 @@
           </section>
         {/if}
 
+        {#if visibleCommands.length}
+          <section class="slash-menu panel" aria-label="Pi slash commands">
+            {#each visibleCommands as command}
+              <button on:click={() => chooseCommand(command)}>
+                <strong>/{command.name}</strong>
+                <small>{command.description} · {command.source}</small>
+              </button>
+            {/each}
+          </section>
+        {/if}
+
+        {#if extensionRequest}
+          <section class="extension-dialog panel" aria-label="Pi request">
+            <div class="panel-head"><span>{extensionRequest.request.title ?? extensionRequest.request.method}</span><button on:click={() => respondToExtensionRequest({ cancelled: true })}>Cancel</button></div>
+            {#if extensionRequest.request.method === 'confirm'}
+              <p>{extensionRequest.request.message}</p>
+              <div class="dialog-actions"><button on:click={() => respondToExtensionRequest({ confirmed: false })}>No</button><button class="primary-action" on:click={() => respondToExtensionRequest({ confirmed: true })}>Yes</button></div>
+            {:else if extensionRequest.request.method === 'select'}
+              <div class="choice-grid compact">
+                {#each extensionRequest.request.options ?? [] as option}
+                  <button on:click={() => respondToExtensionRequest({ value: option.value ?? option.id ?? option })}><strong>{option.label ?? option.name ?? option.value ?? option}</strong></button>
+                {/each}
+              </div>
+            {:else if extensionRequest.request.method === 'input'}
+              <input class="model-search" placeholder={extensionRequest.request.placeholder ?? ''} on:keydown={(event) => event.key === 'Enter' && respondToExtensionRequest({ value: (event.currentTarget as HTMLInputElement).value })} />
+            {:else}
+              <p>{JSON.stringify(extensionRequest.request)}</p>
+            {/if}
+          </section>
+        {/if}
+
         <div class="command-dock">
           <label for="prompt-input">Prompt</label>
-          <input id="prompt-input" bind:value={draft} placeholder={activeSession ? `Ask Pi in ${activeSession.name}…` : 'Create a session first…'} on:keydown={(event) => event.key === 'Enter' && send()} />
+          <input id="prompt-input" bind:value={draft} placeholder={activeSession ? `Ask Pi in ${activeSession.name}…` : 'Create a session first…'} on:input={ensureCommandOptions} on:keydown={(event) => event.key === 'Enter' && send()} />
           <button on:click={send}>Send</button>
         </div>
         {#if error}<p class="error">{error}</p>{/if}

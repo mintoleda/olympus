@@ -59,6 +59,19 @@ struct PiModelOption {
     images: bool,
 }
 
+#[derive(Clone, Serialize)]
+struct PiCommandOption {
+    name: String,
+    description: String,
+    source: String,
+}
+
+#[derive(Clone, Serialize)]
+struct ExtensionUiRequest {
+    session_id: String,
+    request: Value,
+}
+
 #[derive(Clone)]
 struct RunningSession {
     child: Arc<Mutex<Child>>,
@@ -461,6 +474,19 @@ fn spawn_pi_inner(
                         );
                     }
                 }
+                Some("extension_ui_request") => {
+                    let mut request = event.clone();
+                    if let Some(object) = request.as_object_mut() {
+                        object.remove("type");
+                    }
+                    let _ = reader_app.emit(
+                        "pi://extension-ui-request",
+                        ExtensionUiRequest {
+                            session_id: reader_session_id.clone(),
+                            request,
+                        },
+                    );
+                }
                 Some("agent_start") => {
                     current_message_id = format!("{reader_session_id}-a-{}", now_ms());
                     full_response.clear();
@@ -741,6 +767,88 @@ fn set_pi_thinking_level(id: String, level: String, app: AppHandle) -> Result<()
 }
 
 #[tauri::command]
+fn list_pi_commands(id: String, app: AppHandle) -> Result<Vec<PiCommandOption>, String> {
+    let runtime = spawn_pi_inner(app, id.clone(), false)?;
+    write_rpc(
+        &runtime,
+        serde_json::json!({"id": format!("{id}-commands-{}", now_ms()), "type": "get_commands"}),
+    )?;
+    Ok(vec![
+        PiCommandOption {
+            name: "model".into(),
+            description: "Select model".into(),
+            source: "builtin".into(),
+        },
+        PiCommandOption {
+            name: "settings".into(),
+            description: "Open settings".into(),
+            source: "builtin".into(),
+        },
+        PiCommandOption {
+            name: "scoped-models".into(),
+            description: "Enable/disable models for cycling".into(),
+            source: "builtin".into(),
+        },
+        PiCommandOption {
+            name: "compact".into(),
+            description: "Compact session context".into(),
+            source: "builtin".into(),
+        },
+        PiCommandOption {
+            name: "name".into(),
+            description: "Set session display name".into(),
+            source: "builtin".into(),
+        },
+        PiCommandOption {
+            name: "session".into(),
+            description: "Show session info".into(),
+            source: "builtin".into(),
+        },
+        PiCommandOption {
+            name: "new".into(),
+            description: "Start a new session".into(),
+            source: "builtin".into(),
+        },
+        PiCommandOption {
+            name: "resume".into(),
+            description: "Resume a session".into(),
+            source: "builtin".into(),
+        },
+        PiCommandOption {
+            name: "tree".into(),
+            description: "Navigate session tree".into(),
+            source: "builtin".into(),
+        },
+        PiCommandOption {
+            name: "login".into(),
+            description: "Configure provider authentication".into(),
+            source: "builtin".into(),
+        },
+        PiCommandOption {
+            name: "logout".into(),
+            description: "Remove provider authentication".into(),
+            source: "builtin".into(),
+        },
+    ])
+}
+
+#[tauri::command]
+fn respond_extension_ui(
+    id: String,
+    request_id: String,
+    response: Value,
+    app: AppHandle,
+) -> Result<(), String> {
+    let runtime = spawn_pi_inner(app, id, false)?;
+    let mut payload = response;
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("type".into(), Value::String("extension_ui_response".into()));
+        object.insert("id".into(), Value::String(request_id));
+    }
+    write_rpc(&runtime, payload)
+}
+
+#[tauri::command]
 fn compact_session(
     id: String,
     custom_instructions: Option<String>,
@@ -866,6 +974,8 @@ pub fn run() {
             list_pi_models,
             set_pi_model,
             set_pi_thinking_level,
+            list_pi_commands,
+            respond_extension_ui,
             compact_session,
             rename_pi_session,
             close_session,
