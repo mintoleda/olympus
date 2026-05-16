@@ -153,11 +153,10 @@
         {:else}
           <aside class="project-tabs panel pane-pop">
             <div class="panel-head">
-              <span>Projects</span>
+              <button class="panel-title-button" on:click={() => (sessionsCollapsed = true)} aria-label="Minimize sessions tab">Projects</button>
               <div class="mini-actions">
                 <button class="quiet-mini" on:click={pickProjectAndCreate}>Open…</button>
                 <button on:click={() => createSession()}>New</button>
-                <button class="quiet-mini icon-mini" on:click={() => (sessionsCollapsed = true)} aria-label="Minimize sessions tab">−</button>
               </div>
             </div>
           {#each groupedSessions as [project, projectSessions]}
