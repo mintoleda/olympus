@@ -741,6 +741,40 @@ fn set_pi_thinking_level(id: String, level: String, app: AppHandle) -> Result<()
 }
 
 #[tauri::command]
+fn compact_session(
+    id: String,
+    custom_instructions: Option<String>,
+    app: AppHandle,
+) -> Result<(), String> {
+    let runtime = spawn_pi_inner(app, id.clone(), false)?;
+    write_rpc(
+        &runtime,
+        serde_json::json!({"id": format!("{id}-compact-{}", now_ms()), "type": "compact", "customInstructions": custom_instructions}),
+    )
+}
+
+#[tauri::command]
+fn rename_pi_session(id: String, name: String, app: AppHandle) -> Result<(), String> {
+    let runtime = spawn_pi_inner(app.clone(), id.clone(), false)?;
+    write_rpc(
+        &runtime,
+        serde_json::json!({"id": format!("{id}-name-{}", now_ms()), "type": "set_session_name", "name": name}),
+    )?;
+
+    let store = app.state::<SessionStore>();
+    let mut updated_session = None;
+    if let Ok(mut sessions) = store.sessions.lock() {
+        if let Some(session) = sessions.get_mut(&id) {
+            session.name = name;
+            updated_session = Some(session.clone());
+        }
+        let _ = save_sessions(&app, &sessions);
+    }
+    emit_updated_session(&app, updated_session);
+    Ok(())
+}
+
+#[tauri::command]
 fn close_session(id: String, app: AppHandle, store: State<'_, SessionStore>) -> Result<(), String> {
     if let Some(runtime) = store
         .runtimes
@@ -832,6 +866,8 @@ pub fn run() {
             list_pi_models,
             set_pi_model,
             set_pi_thinking_level,
+            compact_session,
+            rename_pi_session,
             close_session,
             send_message
         ])

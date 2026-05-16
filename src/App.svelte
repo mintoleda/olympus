@@ -221,8 +221,56 @@
   async function send() {
     if (!activeSession || !draft.trim()) return;
     activePane = 'chat';
+    const content = draft.trim();
+    if (content.startsWith('/') && await handleSlashCommand(content)) {
+      draft = '';
+      return;
+    }
     const ok = await runAction(() => invoke('send_message', { id: activeSession!.id, content: draft }));
     if (ok !== undefined) draft = '';
+  }
+
+  async function handleSlashCommand(content: string): Promise<boolean> {
+    const [command, ...rest] = content.slice(1).split(/\s+/);
+    const args = rest.join(' ').trim();
+    switch (command) {
+      case 'model':
+      case 'scoped-models':
+        await openConfigChooser('model');
+        if (args) modelFilter = args;
+        return true;
+      case 'settings':
+        activePane = 'settings';
+        return true;
+      case 'new':
+        await createSession();
+        return true;
+      case 'compact':
+        await runAction(() => invoke('compact_session', { id: activeSession!.id, customInstructions: args || null }));
+        return true;
+      case 'name':
+        if (args) await runAction(() => invoke('rename_pi_session', { id: activeSession!.id, name: args }));
+        return true;
+      case 'session':
+        sessions = sessions.map((session) => session.id === activeSession!.id ? {
+          ...session,
+          messages: [...session.messages, {
+            id: `${session.id}-session-${Date.now()}`,
+            role: 'status',
+            content: `session: ${session.pi_session_id ?? session.id}\nmodel: ${session.provider ?? 'unknown'}/${session.model_id ?? session.model ?? 'unknown'}\nthinking: ${session.thinking_level ?? 'default'}\nmessages: ${session.messages.length}`,
+            timestamp: Date.now()
+          }]
+        } : session);
+        return true;
+      case 'resume':
+      case 'tree':
+        sessionsCollapsed = false;
+        return true;
+      case 'quit':
+        return true;
+      default:
+        return false;
+    }
   }
 
   async function ensureModelOptions() {
