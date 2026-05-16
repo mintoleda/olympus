@@ -47,7 +47,7 @@
   Deliverable
   - Multiple independent Pi chat sessions work inside the hub.
 
-- [ ] Phase 3 — Home Screen
+- [x] Phase 3 — Home Screen
 
   Goal: establish the landing experience.
 
