@@ -193,19 +193,44 @@ fn finalize_assistant(app: &AppHandle, session_id: &str, message_id: &str, conte
     );
 }
 
+fn value_string(value: Option<&Value>) -> Option<String> {
+    value.and_then(|value| match value {
+        Value::String(text) if !text.trim().is_empty() => Some(text.to_string()),
+        Value::Number(number) => Some(number.to_string()),
+        _ => None,
+    })
+}
+
+fn model_label(data: &Value) -> Option<String> {
+    if let Some(model) = value_string(data.get("model").or_else(|| data.pointer("/config/model"))) {
+        return Some(model);
+    }
+
+    let model = data.get("model").or_else(|| data.pointer("/config/model"))?;
+    value_string(model.get("name"))
+        .or_else(|| value_string(model.get("id")))
+        .or_else(|| value_string(model.get("model")))
+}
+
+fn provider_label(data: &Value) -> Option<String> {
+    value_string(data.get("provider").or_else(|| data.pointer("/config/provider")))
+        .or_else(|| value_string(data.pointer("/model/provider")))
+        .or_else(|| value_string(data.pointer("/config/model/provider")))
+        .or_else(|| value_string(data.pointer("/model/api")))
+}
+
 fn handle_state_response(app: &AppHandle, session_id: &str, data: &Value) {
-    let pi_session_id = data.get("sessionId").or_else(|| data.get("session_id")).and_then(Value::as_str).map(str::to_string);
-    let pi_session_file = data.get("sessionFile").or_else(|| data.get("session_file")).and_then(Value::as_str).map(str::to_string);
-    let session_name = data.get("sessionName").or_else(|| data.get("session_name")).and_then(Value::as_str).map(str::to_string);
-    let model = data.get("model").or_else(|| data.pointer("/config/model")).and_then(Value::as_str).map(str::to_string);
-    let provider = data.get("provider").or_else(|| data.pointer("/config/provider")).and_then(Value::as_str).map(str::to_string);
-    let thinking_level = data
-        .get("thinkingLevel")
-        .or_else(|| data.get("thinking_level"))
-        .or_else(|| data.pointer("/config/thinkingLevel"))
-        .or_else(|| data.pointer("/config/thinking_level"))
-        .and_then(Value::as_str)
-        .map(str::to_string);
+    let pi_session_id = value_string(data.get("sessionId").or_else(|| data.get("session_id")));
+    let pi_session_file = value_string(data.get("sessionFile").or_else(|| data.get("session_file")));
+    let session_name = value_string(data.get("sessionName").or_else(|| data.get("session_name")));
+    let model = model_label(data);
+    let provider = provider_label(data);
+    let thinking_level = value_string(
+        data.get("thinkingLevel")
+            .or_else(|| data.get("thinking_level"))
+            .or_else(|| data.pointer("/config/thinkingLevel"))
+            .or_else(|| data.pointer("/config/thinking_level")),
+    );
 
     let store = app.state::<SessionStore>();
     let mut updated_session = None;
@@ -241,6 +266,13 @@ fn handle_state_response(app: &AppHandle, session_id: &str, data: &Value) {
     }
 }
 
+fn request_pi_state(runtime: &RunningSession, session_id: &str) -> Result<(), String> {
+    let mut stdin = runtime.stdin.lock().map_err(|_| "Pi stdin lock poisoned")?;
+    let request = serde_json::json!({"id": format!("{session_id}-state-{}", now_ms()), "type": "get_state"});
+    writeln!(stdin, "{request}").map_err(|err| err.to_string())?;
+    stdin.flush().map_err(|err| err.to_string())
+}
+
 fn spawn_pi(app: AppHandle, session_id: String) -> Result<RunningSession, String> {
     let store = app.state::<SessionStore>();
     if let Some(existing) = store
@@ -250,6 +282,7 @@ fn spawn_pi(app: AppHandle, session_id: String) -> Result<RunningSession, String
         .get(&session_id)
         .cloned()
     {
+        request_pi_state(&existing, &session_id)?;
         return Ok(existing);
     }
 
@@ -368,12 +401,7 @@ fn spawn_pi(app: AppHandle, session_id: String) -> Result<RunningSession, String
         });
     }
 
-    {
-        let mut stdin = runtime.stdin.lock().map_err(|_| "Pi stdin lock poisoned")?;
-        let request = serde_json::json!({"id": format!("{session_id}-state-{}", now_ms()), "type": "get_state"});
-        writeln!(stdin, "{request}").map_err(|err| err.to_string())?;
-        stdin.flush().map_err(|err| err.to_string())?;
-    }
+    request_pi_state(&runtime, &session_id)?;
 
     Ok(runtime)
 }
