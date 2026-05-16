@@ -475,17 +475,23 @@ fn spawn_pi_inner(
                     }
                 }
                 Some("extension_ui_request") => {
-                    let mut request = event.clone();
-                    if let Some(object) = request.as_object_mut() {
-                        object.remove("type");
+                    let method = event
+                        .get("method")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    if matches!(method, "select" | "confirm" | "input") {
+                        let mut request = event.clone();
+                        if let Some(object) = request.as_object_mut() {
+                            object.remove("type");
+                        }
+                        let _ = reader_app.emit(
+                            "pi://extension-ui-request",
+                            ExtensionUiRequest {
+                                session_id: reader_session_id.clone(),
+                                request,
+                            },
+                        );
                     }
-                    let _ = reader_app.emit(
-                        "pi://extension-ui-request",
-                        ExtensionUiRequest {
-                            session_id: reader_session_id.clone(),
-                            request,
-                        },
-                    );
                 }
                 Some("agent_start") => {
                     current_message_id = format!("{reader_session_id}-a-{}", now_ms());

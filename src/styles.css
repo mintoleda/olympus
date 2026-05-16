@@ -730,7 +730,7 @@ h1 {
 
 .inspector {
   display: grid;
-  grid-template-rows: minmax(0, 1fr) minmax(180px, 0.75fr);
+  grid-template-rows: minmax(0, 1fr);
   gap: 12px;
   min-height: 0;
   overflow: hidden;

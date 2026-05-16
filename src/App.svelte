@@ -651,11 +651,6 @@
               {/each}
             </div>
           </section>
-          <section class="panel context-card">
-            <p class="eyebrow">Context</p>
-            <h2>{activeSession?.name ?? 'No session'}</h2>
-            <p>{activeSession?.project_path ?? 'Create a project-bound Pi session.'}</p>
-          </section>
         </aside>
       {/if}
     </div>
