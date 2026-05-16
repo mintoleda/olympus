@@ -6,7 +6,7 @@
 
   type PaneId = 'home' | 'chat' | 'widgets' | 'search' | 'settings';
   type ChatMessage = { id: string; role: 'user' | 'assistant' | 'status'; content: string; timestamp: number };
-  type PiSession = { id: string; name: string; project_path: string; status: string; messages: ChatMessage[] };
+  type PiSession = { id: string; name: string; project_path: string; status: string; messages: ChatMessage[]; pi_session_id?: string | null; pi_session_file?: string | null };
   type SessionEvent = { session_id: string; message: ChatMessage };
 
   const panes: Array<{ id: PaneId; label: string; key: string; description: string }> = [
@@ -137,13 +137,16 @@
   <section class="stage">
     <header class="masthead">
       <div><p class="kicker">Pi workspace</p><h1>{active.label}</h1></div>
-      <button class="ghost-button" on:click={pickProjectAndCreate}>＋ New session</button>
+      <div class="masthead-actions">
+        <button class="ghost-button primary-ghost" on:click={() => createSession()}>＋ New session</button>
+        <button class="ghost-button quiet-ghost" on:click={pickProjectAndCreate}>Open project…</button>
+      </div>
     </header>
 
     <div class="layout" class:chat-layout={activePane === 'chat'}>
       {#if activePane === 'chat'}
         <aside class="project-tabs panel pane-pop">
-          <div class="panel-head"><span>Projects</span><button on:click={pickProjectAndCreate}>＋</button></div>
+          <div class="panel-head"><span>Projects</span><div class="mini-actions"><button on:click={() => createSession()}>New</button><button class="quiet-mini" on:click={pickProjectAndCreate}>Open…</button></div></div>
           {#each groupedSessions as [project, projectSessions]}
             <p class="project-label">{project}</p>
             {#each projectSessions as session}
