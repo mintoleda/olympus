@@ -32,6 +32,9 @@ struct PiSession {
     session_dir: String,
     pi_session_id: Option<String>,
     pi_session_file: Option<String>,
+    model: Option<String>,
+    provider: Option<String>,
+    thinking_level: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -182,9 +185,18 @@ fn finalize_assistant(app: &AppHandle, session_id: &str, message_id: &str, conte
 }
 
 fn handle_state_response(app: &AppHandle, session_id: &str, data: &Value) {
-    let pi_session_id = data.get("sessionId").and_then(Value::as_str).map(str::to_string);
-    let pi_session_file = data.get("sessionFile").and_then(Value::as_str).map(str::to_string);
-    let session_name = data.get("sessionName").and_then(Value::as_str).map(str::to_string);
+    let pi_session_id = data.get("sessionId").or_else(|| data.get("session_id")).and_then(Value::as_str).map(str::to_string);
+    let pi_session_file = data.get("sessionFile").or_else(|| data.get("session_file")).and_then(Value::as_str).map(str::to_string);
+    let session_name = data.get("sessionName").or_else(|| data.get("session_name")).and_then(Value::as_str).map(str::to_string);
+    let model = data.get("model").or_else(|| data.pointer("/config/model")).and_then(Value::as_str).map(str::to_string);
+    let provider = data.get("provider").or_else(|| data.pointer("/config/provider")).and_then(Value::as_str).map(str::to_string);
+    let thinking_level = data
+        .get("thinkingLevel")
+        .or_else(|| data.get("thinking_level"))
+        .or_else(|| data.pointer("/config/thinkingLevel"))
+        .or_else(|| data.pointer("/config/thinking_level"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
 
     let store = app.state::<SessionStore>();
     if let Ok(mut sessions) = store.sessions.lock() {
@@ -197,6 +209,15 @@ fn handle_state_response(app: &AppHandle, session_id: &str, data: &Value) {
             }
             if let Some(name) = session_name {
                 session.name = name;
+            }
+            if let Some(model) = model {
+                session.model = Some(model);
+            }
+            if let Some(provider) = provider {
+                session.provider = Some(provider);
+            }
+            if let Some(thinking_level) = thinking_level {
+                session.thinking_level = Some(thinking_level);
             }
             if session.status == "starting" {
                 session.status = "idle".into();
@@ -366,6 +387,9 @@ fn create_session(project_path: Option<String>, app: AppHandle, store: State<'_,
         session_dir: String::new(),
         pi_session_id: None,
         pi_session_file: None,
+        model: None,
+        provider: None,
+        thinking_level: None,
     };
 
     {

@@ -4,11 +4,17 @@
   import { listen } from '@tauri-apps/api/event';
   import { open } from '@tauri-apps/plugin-dialog';
   import {
+    animateActiveNav,
+    animateChatHistory,
+    animateInspectorRefresh,
     animateLatestMessage,
+    animateMetricTick,
     animatePaneChange,
     animateSessionRail,
+    animateSessionStack,
     animateShellEnter,
     animateStreamingStatus,
+    attachInteractionAnimations,
     createAppAnimationScope
   } from './animations';
   import type { Scope } from 'animejs';
@@ -45,6 +51,9 @@
   let lastAnimatedCollapsed = sessionsCollapsed;
   let lastAnimatedMessageCount = 0;
   let lastAnimatedStatus = '';
+  let lastAnimatedSessionId = '';
+  let lastAnimatedSessionCount = 0;
+  let lastAnimatedMetricKey = '';
   $: active = panes.find((pane) => pane.id === activePane) ?? panes[0];
   $: activeSession = sessions.find((session) => session.id === activeSessionId) ?? sessions[0];
   $: groupedSessions = Object.entries(
@@ -52,9 +61,9 @@
       (groups[session.project_path] ??= []).push(session);
       return groups;
     }, {})
-  );
+  ).sort(([a], [b]) => a.localeCompare(b));
   $: recentSessions = [...sessions]
-    .sort((a, b) => Math.max(...b.messages.map((message) => message.timestamp), 0) - Math.max(...a.messages.map((message) => message.timestamp), 0))
+    .sort((a, b) => latestTimestamp(b) - latestTimestamp(a))
     .slice(0, 6);
   $: activeProjectName = activeSession?.project_path.split('/').filter(Boolean).at(-1) ?? 'workspace';
   $: homeStats = [
@@ -63,6 +72,7 @@
     { label: 'Events', value: String(sessions.reduce((count, session) => count + session.messages.length, 0)), note: 'local transcript entries' }
   ];
   $: activeMessageCount = activeSession?.messages.length ?? 0;
+  $: metricKey = `${sessions.length}:${activeProjectName}:${activeMessageCount}`;
   $: if (animationReady && rootEl && activePane !== lastAnimatedPane) {
     lastAnimatedPane = activePane;
     tick().then(() => animatePaneChange(rootEl));
@@ -70,6 +80,25 @@
   $: if (animationReady && rootEl && sessionsCollapsed !== lastAnimatedCollapsed) {
     lastAnimatedCollapsed = sessionsCollapsed;
     tick().then(() => animateSessionRail(rootEl, sessionsCollapsed));
+  }
+  $: if (animationReady && rootEl && activeSession?.id && activeSession.id !== lastAnimatedSessionId) {
+    lastAnimatedSessionId = activeSession.id;
+    tick().then(() => {
+      animateChatHistory(rootEl);
+      animateInspectorRefresh(rootEl);
+      animateActiveNav(rootEl);
+    });
+  }
+  $: if (animationReady && rootEl && sessions.length !== lastAnimatedSessionCount) {
+    lastAnimatedSessionCount = sessions.length;
+    tick().then(() => {
+      animateSessionStack(rootEl);
+      animateMetricTick(rootEl);
+    });
+  }
+  $: if (animationReady && rootEl && metricKey !== lastAnimatedMetricKey) {
+    lastAnimatedMetricKey = metricKey;
+    tick().then(() => animateMetricTick(rootEl));
   }
   $: if (animationReady && rootEl && activeMessageCount > lastAnimatedMessageCount) {
     lastAnimatedMessageCount = activeMessageCount;
@@ -80,19 +109,39 @@
     if (activeSession.status === 'streaming') tick().then(() => animateStreamingStatus(rootEl));
   }
 
+  const timeFormatter = new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit' });
+
   function formatTime(timestamp: number) {
     if (!timestamp) return 'no activity';
-    return new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit' }).format(new Date(timestamp));
+    return timeFormatter.format(new Date(timestamp));
+  }
+
+  function latestTimestamp(session: PiSession): number {
+    return session.messages.reduce((max, message) => Math.max(max, message.timestamp), 0);
   }
 
   async function refreshSessions() {
     sessions = await invoke<PiSession[]>('list_sessions');
-    activeSessionId = sessions.find((session) => session.status === 'active')?.id ?? sessions[0]?.id ?? '';
+    const stillExists = sessions.some((session) => session.id === activeSessionId);
+    if (!stillExists) {
+      activeSessionId = sessions.find((session) => session.status === 'active')?.id ?? sessions[0]?.id ?? '';
+    }
+  }
+
+  async function runAction<T>(fn: () => Promise<T>): Promise<T | undefined> {
+    try {
+      const result = await fn();
+      error = '';
+      return result;
+    } catch (err) {
+      error = String(err);
+      return undefined;
+    }
   }
 
   async function createSession(path?: string) {
-    error = '';
-    const session = await invoke<PiSession>('create_session', { projectPath: path || null });
+    const session = await runAction(() => invoke<PiSession>('create_session', { projectPath: path || null }));
+    if (!session) return;
     sessions = [...sessions.filter((item) => item.id !== session.id), session];
     activeSessionId = session.id;
     activePane = 'chat';
@@ -100,14 +149,14 @@
   }
 
   async function pickProjectAndCreate() {
-    error = '';
-    const selected = await open({ directory: true, multiple: false, title: 'Choose a project folder' });
+    const selected = await runAction(() => open({ directory: true, multiple: false, title: 'Choose a project folder' }));
     if (typeof selected !== 'string') return;
     await createSession(selected);
   }
 
   async function switchSession(id: string) {
-    await invoke('switch_session', { id });
+    const ok = await runAction(() => invoke('switch_session', { id }));
+    if (ok === undefined) return;
     activeSessionId = id;
     await refreshSessions();
   }
@@ -118,50 +167,58 @@
   }
 
   async function closeSession(id: string) {
-    await invoke('close_session', { id });
+    const ok = await runAction(() => invoke('close_session', { id }));
+    if (ok === undefined) return;
     await refreshSessions();
   }
 
   async function send() {
     if (!activeSession || !draft.trim()) return;
     activePane = 'chat';
-    await invoke('send_message', { id: activeSession.id, content: draft });
-    draft = '';
+    const ok = await runAction(() => invoke('send_message', { id: activeSession!.id, content: draft }));
+    if (ok !== undefined) draft = '';
   }
 
   onMount(() => {
     let unlisten: (() => void) | undefined;
+    let disposed = false;
+    const detachInteractions = attachInteractionAnimations(rootEl);
     animationScope = createAppAnimationScope(rootEl);
     animateShellEnter(rootEl, animationScope);
     animationReady = true;
     lastAnimatedMessageCount = activeMessageCount;
     lastAnimatedStatus = activeSession?.status ?? '';
-
-    listen<SessionEvent>('pi://message', (event) => {
-      const { session_id, message } = event.payload;
-      sessions = sessions.map((session) => {
-        if (session.id !== session_id) return session;
-        if (message.role === 'status') return { ...session, status: 'idle' };
-        if (message.role === 'assistant') {
-          const existing = session.messages.find((item) => item.id === message.id);
-          if (existing) {
-            return {
-              ...session,
-              status: 'streaming',
-              messages: session.messages.map((item) =>
-                item.id === message.id ? { ...item, content: item.content + message.content } : item
-              )
-            };
-          }
-        }
-        return { ...session, status: message.role === 'assistant' ? 'streaming' : session.status, messages: [...session.messages, message] };
-      });
-    }).then((cleanup) => {
-      unlisten = cleanup;
-    });
+    lastAnimatedSessionId = activeSession?.id ?? '';
+    lastAnimatedSessionCount = sessions.length;
+    lastAnimatedMetricKey = metricKey;
 
     (async () => {
       try {
+        const cleanup = await listen<SessionEvent>('pi://message', (event) => {
+          const { session_id, message } = event.payload;
+          sessions = sessions.map((session) => {
+            if (session.id !== session_id) return session;
+            if (message.role === 'status') return { ...session, status: message.content || 'idle' };
+            if (message.role === 'assistant') {
+              const existing = session.messages.find((item) => item.id === message.id);
+              if (existing) {
+                return {
+                  ...session,
+                  status: 'streaming',
+                  messages: session.messages.map((item) =>
+                    item.id === message.id ? { ...item, content: item.content + message.content } : item
+                  )
+                };
+              }
+            }
+            return { ...session, status: message.role === 'assistant' ? 'streaming' : session.status, messages: [...session.messages, message] };
+          });
+        });
+        if (disposed) {
+          cleanup();
+          return;
+        }
+        unlisten = cleanup;
         await refreshSessions();
         if (sessions.length === 0) await createSession();
       } catch (err) {
@@ -170,7 +227,9 @@
     })();
 
     return () => {
+      disposed = true;
       unlisten?.();
+      detachInteractions();
       animationScope?.revert();
     };
   });
