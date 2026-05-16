@@ -57,6 +57,21 @@ input { color: var(--paper); outline: none; }
   overflow: hidden;
 }
 
+.fps-overlay {
+  position: fixed;
+  right: 10px;
+  bottom: 8px;
+  z-index: 9999;
+  color: var(--accent);
+  background: rgba(20, 20, 18, 0.78);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 3px 7px;
+  font-size: 11px;
+  line-height: 1;
+  pointer-events: none;
+}
+
 .nav-rail,
 .panel,
 .topbar {

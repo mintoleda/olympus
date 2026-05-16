@@ -327,6 +327,26 @@
   }
 
   let hotkeysOpen = false;
+  let fps = 0;
+
+  function startFpsCounter() {
+    let frames = 0;
+    let last = performance.now();
+    let frameId = 0;
+
+    const loop = (now: number) => {
+      frames += 1;
+      if (now - last >= 1000) {
+        fps = Math.round((frames * 1000) / (now - last));
+        frames = 0;
+        last = now;
+      }
+      frameId = requestAnimationFrame(loop);
+    };
+
+    frameId = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(frameId);
+  }
 
   async function handleSlashCommand(content: string): Promise<boolean> {
     const [command, ...rest] = content.slice(1).split(/\s+/);
@@ -501,6 +521,7 @@
     setZoom(zoom);
     window.addEventListener('keydown', handleGlobalKeydown);
     const detachInteractions = attachInteractionAnimations(rootEl);
+    const stopFpsCounter = startFpsCounter();
     animationScope = createAppAnimationScope(rootEl);
     animateShellEnter(rootEl, animationScope);
     animationReady = true;
@@ -592,6 +613,7 @@
       unlisteners.forEach((unlisten) => unlisten());
       window.removeEventListener('keydown', handleGlobalKeydown);
       detachInteractions();
+      stopFpsCounter();
       animationScope?.revert();
     };
   });
@@ -864,4 +886,5 @@
       {/if}
     </div>
   </section>
+  <div class="fps-overlay">fps: {fps}</div>
 </main>
