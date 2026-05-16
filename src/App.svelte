@@ -4,15 +4,12 @@
   import { listen } from '@tauri-apps/api/event';
   import { open } from '@tauri-apps/plugin-dialog';
   import {
-    animateActiveNav,
     animateChatHistory,
     animateInspectorRefresh,
     animateLatestMessage,
     animateMetricTick,
     animatePaneChange,
-    animateSessionRail,
-    animateSessionStack,
-    animateShellEnter,
+    animateVoidEnter,
     animateStreamingStatus,
     attachInteractionAnimations,
     createAppAnimationScope
@@ -81,11 +78,24 @@
   let animationReady = false;
   let lastAnimatedPane: PaneId = activePane;
   let lastAnimatedCollapsed = sessionsCollapsed;
+  let menuOpen = false;
+  let infoCardVisible = true;
+
+  function menuClickOutside(node: HTMLElement) {
+    const handle = (e: MouseEvent) => {
+      if (!node.contains(e.target as Node)) menuOpen = false;
+    };
+    const add = () => document.addEventListener('mousedown', handle);
+    const remove = () => document.removeEventListener('mousedown', handle);
+    setTimeout(add, 0);
+    return { destroy: remove };
+  }
   let lastAnimatedMessageCount = 0;
   let lastAnimatedStatus = '';
   let lastAnimatedSessionId = '';
   let lastAnimatedSessionCount = 0;
   let lastAnimatedMetricKey = '';
+  let sessionRailAnimationFrame = 0;
   $: active = panes.find((pane) => pane.id === activePane) ?? panes[0];
   $: activeSession = sessions.find((session) => session.id === activeSessionId) ?? sessions[0];
   $: groupedSessions = Object.entries(
@@ -141,16 +151,11 @@
     lastAnimatedPane = activePane;
     tick().then(() => animatePaneChange(rootEl));
   }
-  $: if (animationReady && rootEl && sessionsCollapsed !== lastAnimatedCollapsed) {
-    lastAnimatedCollapsed = sessionsCollapsed;
-    tick().then(() => animateSessionRail(rootEl, sessionsCollapsed));
-  }
   $: if (animationReady && rootEl && activeSession?.id && activeSession.id !== lastAnimatedSessionId) {
     lastAnimatedSessionId = activeSession.id;
     tick().then(() => {
       animateChatHistory(rootEl);
       animateInspectorRefresh(rootEl);
-      animateActiveNav(rootEl);
     });
   }
   $: if (activeSession?.id) {
@@ -160,10 +165,7 @@
   }
   $: if (animationReady && rootEl && sessions.length !== lastAnimatedSessionCount) {
     lastAnimatedSessionCount = sessions.length;
-    tick().then(() => {
-      animateSessionStack(rootEl);
-      animateMetricTick(rootEl);
-    });
+    tick().then(() => animateMetricTick(rootEl));
   }
   $: if (animationReady && rootEl && metricKey !== lastAnimatedMetricKey) {
     lastAnimatedMetricKey = metricKey;
@@ -219,6 +221,8 @@
   function latestTimestamp(session: PiSession): number {
     return session.messages.reduce((max, message) => Math.max(max, message.timestamp), 0);
   }
+
+
 
   async function scrollChatToBottom() {
     await tick();
@@ -523,7 +527,7 @@
     const detachInteractions = attachInteractionAnimations(rootEl);
     const stopFpsCounter = startFpsCounter();
     animationScope = createAppAnimationScope(rootEl);
-    animateShellEnter(rootEl, animationScope);
+    animateVoidEnter(rootEl, animationScope);
     animationReady = true;
     lastAnimatedMessageCount = activeMessageCount;
     lastAnimatedStatus = activeSession?.status ?? '';
@@ -612,6 +616,7 @@
       disposed = true;
       unlisteners.forEach((unlisten) => unlisten());
       window.removeEventListener('keydown', handleGlobalKeydown);
+      if (sessionRailAnimationFrame) cancelAnimationFrame(sessionRailAnimationFrame);
       detachInteractions();
       stopFpsCounter();
       animationScope?.revert();
@@ -619,96 +624,204 @@
   });
 </script>
 
-<main class="ops-shell" bind:this={rootEl}>
-  <aside class="nav-rail" aria-label="Primary navigation">
-    <div class="product-mark"><span>OL</span><small>Olympus</small></div>
-    <nav class="pane-tabs">
-      {#each panes as pane}
-        <button class:active={pane.id === activePane} on:click={() => { activePane = pane.id; if (pane.id !== 'chat') activeChooser = null; }}>
-          <b>{pane.key}</b><span>{pane.label}</span>
-        </button>
-      {/each}
-    </nav>
-    <div class="rail-status"><span class="status-dot"></span><p>{sessions.length} mounted</p></div>
-  </aside>
-
-  <section class="workbench">
-    <header class="topbar">
-      <div class="crumbs"><span>workspace</span><strong>{activeProjectName}</strong><em>{active.label}</em></div>
-      <div class="topbar-actions">
-        {#if activeSession}
-          <button
-            class="preset-chip preset-{activePreset ?? 'off'}"
-            on:click={() => cyclePrimary(1)}
-            title="Cycle plan → build → ask → off (Shift+Tab in prompt)"
-            aria-label="Cycle primary preset"
-          >
-            <small>primary</small><strong>{activePreset ?? 'off'}</strong>
-          </button>
-        {/if}
-        <span class="pi-state" class:streaming={activeSession?.status === 'streaming'}>Pi: {activeSession?.status ?? 'offline'}</span>
-        <button class="text-button" on:click={pickProjectAndCreate}>Open folder</button>
-        <button class="solid-button" on:click={() => createSession()}>New session</button>
+<main class="void" bind:this={rootEl}>
+  <!-- Top-left chrome -->
+  <header class="void-chrome">
+    <button class="menu-pill" on:click={() => (menuOpen = !menuOpen)}>MENU</button>
+    <button class="gear-btn" on:click={() => { activePane = 'settings'; menuOpen = false; }} aria-label="Settings">⚙</button>
+    {#if menuOpen}
+      <div class="menu-popover" use:menuClickOutside>
+        <div class="menu-section">
+          <p class="menu-head">TOOLS</p>
+          {#each panes as pane}
+            <button class="menu-row" class:active={pane.id === activePane} on:click={() => { activePane = pane.id; if (pane.id !== 'chat') activeChooser = null; menuOpen = false; }}>
+              <span>{pane.label}</span>
+            </button>
+          {/each}
+        </div>
+        <div class="menu-section">
+          <p class="menu-head">SESSIONS</p>
+          {#if recentSessions.length}
+            {#each recentSessions as session}
+              <button class="menu-row" class:current={session.id === activeSessionId} on:click={() => { openSession(session.id); menuOpen = false; }}>
+                <span>{session.name}</span><small>{session.status}</small>
+              </button>
+            {/each}
+          {:else}
+            <p class="menu-empty">No sessions yet</p>
+          {/if}
+        </div>
+        <div class="menu-footer">
+          <button on:click={() => { pickProjectAndCreate(); menuOpen = false; }}>Open folder</button>
+          <button on:click={() => { createSession(); menuOpen = false; }}>New session</button>
+        </div>
       </div>
-    </header>
+    {/if}
+  </header>
 
-    <div class="layout" class:chat-layout={activePane === 'chat'} class:sessions-collapsed={activePane === 'chat' && sessionsCollapsed}>
-      {#if activePane === 'chat'}
-        {#if sessionsCollapsed}
-          <button class="sessions-peek panel" on:click={() => (sessionsCollapsed = false)} aria-label="Expand session list">
-            <span>Sessions</span><strong>{sessions.length}</strong>
-          </button>
-        {:else}
-          <aside class="session-tree panel">
-            <div class="panel-head">
-              <button class="panel-title-button" on:click={() => (sessionsCollapsed = true)} aria-label="Collapse session list">Session stack</button>
-              <div class="mini-actions">
-                <button class="quiet-mini" on:click={pickProjectAndCreate}>Open</button>
-                <button on:click={() => createSession()}>New</button>
-              </div>
-            </div>
-            {#each groupedSessions as [project, projectSessions]}
-              <p class="project-label">{project}</p>
-              {#each projectSessions as session}
-                <div class="session-row" class:chosen={session.id === activeSession?.id}>
-                  <button class="session-select" on:click={() => switchSession(session.id)}>
-                    <strong>{session.name}</strong><small>{session.project_path}</small><em>{session.status}</em>
-                  </button>
-                  <button class="close" aria-label={`Close ${session.name}`} on:click={() => closeSession(session.id)}>×</button>
-                </div>
-              {/each}
-            {/each}
-          </aside>
-        {/if}
-      {/if}
+  <!-- Stage -->
+  <section class="void-stage">
+    <div class="tool-shell" class:no-info={!(infoCardVisible && (activePane === 'chat' || activePane === 'home'))}>
 
-      <section class="main-panel panel" class:home-panel={activePane === 'home'} class:info-panel={activePane !== 'chat'}>
+      <!-- Main tool card -->
+      <div class="tool-card">
+        <div class="tool-card__head">
+          <div class="tool-card__icon">{active.key}</div>
+          <span class="tool-card__label">{active.label}</span>
+          <div class="tool-card__actions">
+            {#if activePane === 'chat' && activeSession}
+              <button
+                class="preset-chip preset-{activePreset ?? 'off'}"
+                on:click={() => cyclePrimary(1)}
+                title="Cycle plan → build → ask → off"
+              ><small>primary</small><strong>{activePreset ?? 'off'}</strong></button>
+              <span class="pi-state" class:streaming={activeSession.status === 'streaming'}>{activeSession.status}</span>
+            {/if}
+            {#if activePane === 'chat' || activePane === 'home'}
+              <button class="info-toggle" on:click={() => (infoCardVisible = !infoCardVisible)} title={infoCardVisible ? 'Hide info' : 'Show info'}>
+                {infoCardVisible ? '↦' : '↤'}
+              </button>
+            {/if}
+          </div>
+        </div>
+
         {#if activePane === 'chat' && activeSession}
-          <div class="transcript-head">
-            <div><p class="eyebrow">Active transcript</p><h1>{activeSession.name}</h1></div>
-            <span class:streaming={activeSession.status === 'streaming'}>{activeSession.status}</span>
+          <div class="chat-body">
+            <div class="transcript-head">
+              <div><p class="eyebrow">Active transcript</p><p class="session-name">{activeSession.name}</p></div>
+              <span class="status-pill" class:streaming={activeSession.status === 'streaming'}>{activeSession.status}</span>
+            </div>
+            <div class="chat-log" bind:this={chatLogEl}>
+              {#each activeSession.messages as message, index}
+                <article class="message {message.role}" style={`--i: ${index}`}>
+                  <header><span>{message.role}</span><time>{formatTime(message.timestamp)}</time></header>
+                  <p>{message.content}</p>
+                </article>
+              {/each}
+            </div>
+            {#if nonPresetStatuses.length || aboveWidgets.length}
+              <div class="pi-status-feed">
+                {#if nonPresetStatuses.length}
+                  <div class="status-row">
+                    {#each nonPresetStatuses as status}
+                      <span class="status-chip"><small>{status.key}</small><strong>{stripAnsi(status.text).trim()}</strong></span>
+                    {/each}
+                  </div>
+                {/if}
+                {#each aboveWidgets as widget (widget.key)}
+                  <pre class="pi-widget" aria-label={`pi widget ${widget.key}`}>{widget.lines.map(stripAnsi).join('\n')}</pre>
+                {/each}
+              </div>
+            {/if}
           </div>
-          <div class="chat-log" bind:this={chatLogEl}>
-            {#each activeSession.messages as message, index}
-              <article class="message {message.role}" style={`--i: ${index}`}>
-                <header><span>{message.role}</span><time>{formatTime(message.timestamp)}</time></header>
-                <p>{message.content}</p>
-              </article>
-            {/each}
+
+          {#if activeChooser}
+            <section class="config-popover panel" aria-label="Pi configuration chooser">
+              <div class="panel-head">
+                <span>Switch {activeChooser}</span>
+                <button on:click={() => (activeChooser = null)}>Close</button>
+              </div>
+              {#if activeChooser === 'thinking'}
+                <div class="choice-grid compact">
+                  {#each thinkingLevels as level}
+                    <button class:chosen={level === activeSession?.thinking_level} on:click={() => selectThinking(level)}>
+                      <strong>{level}</strong>
+                    </button>
+                  {/each}
+                </div>
+              {:else if modelLoading}
+                <p class="empty-note">Loading Pi model registry…</p>
+              {:else if activeChooser === 'provider'}
+                <div class="choice-grid compact">
+                  {#each providerCounts as option}
+                    <button class:chosen={option.provider === activeSession?.provider} on:click={() => selectProvider(option.provider)}>
+                      <strong>{option.provider}</strong>
+                      <small>{option.count} models available</small>
+                    </button>
+                  {/each}
+                </div>
+              {:else}
+                <input class="model-search" bind:value={modelFilter} placeholder={`Filter ${activeSession?.provider ?? 'current provider'} models…`} />
+                {#if activeProviderModels.length && !modelFilter}
+                  <p class="chooser-hint">Showing {activeProviderModels.length} models for {activeSession?.provider}.</p>
+                {:else if !activeProviderModels.length}
+                  <p class="chooser-hint">No models found for the current provider yet.</p>
+                {/if}
+                <div class="choice-grid models">
+                  {#each filteredModels as model}
+                    <button class:chosen={model.provider === activeSession?.provider && model.id === activeSession?.model_id} on:click={() => selectModel(model)}>
+                      <strong>{model.id}</strong>
+                      <small>{model.provider} · ctx {model.context} · out {model.max_output} · thinking {model.reasoning ? 'yes' : 'no'}</small>
+                    </button>
+                  {/each}
+                </div>
+              {/if}
+            </section>
+          {/if}
+
+          {#if draft.startsWith('/')}
+            <section class="slash-menu panel" aria-label="Pi slash commands">
+              {#if visibleCommands.length}
+                {#each visibleCommands as command}
+                  <button on:click={() => chooseCommand(command)}>
+                    <strong>/{command.name}</strong>
+                    <small>
+                      {command.description || 'no description'}
+                      <em class="cmd-source cmd-{command.source}">{command.source}{command.location ? ` · ${command.location}` : ''}</em>
+                    </small>
+                  </button>
+                {/each}
+              {:else}
+                <p class="empty-note">No matching commands. Type to fuzzy-filter.</p>
+              {/if}
+              <button class="slash-refresh" on:click={refreshCommandOptions} type="button">Refresh commands</button>
+            </section>
+          {/if}
+
+          <div class="card-footer">
+            <div class="command-dock">
+              <label for="prompt-input">Prompt</label>
+              <input id="prompt-input" bind:value={draft} placeholder={`Ask Pi in ${activeSession.name}…`} on:input={ensureCommandOptions} on:keydown={(event) => event.key === 'Enter' && send()} />
+              <button on:click={send}>Send</button>
+            </div>
+            {#if belowWidgets.length}
+              <div class="pi-status-feed below">
+                {#each belowWidgets as widget (widget.key)}
+                  <pre class="pi-widget" aria-label={`pi widget ${widget.key}`}>{widget.lines.map(stripAnsi).join('\n')}</pre>
+                {/each}
+              </div>
+            {/if}
+            {#if error}<p class="error">{error}</p>{/if}
           </div>
+
+        {:else if activePane === 'chat'}
+          <div class="tool-card__body">
+            <div class="placeholder-copy">
+              <p class="eyebrow">CHAT / No session</p>
+              <h1>No active session.</h1>
+              <p>Open a project folder or create a new session to get started.</p>
+            </div>
+          </div>
+          <div class="card-footer">
+            <div class="command-dock">
+              <label for="prompt-input">Prompt</label>
+              <input id="prompt-input" bind:value={draft} placeholder="Create a session first…" disabled />
+              <button disabled>Send</button>
+            </div>
+          </div>
+
         {:else if activePane === 'home'}
-          <div class="home-surface">
+          <div class="home-body">
             <section class="launch-card">
               <p class="eyebrow">Local command center</p>
-              <h1>Pick up the thread without opening another terminal.</h1>
-              <p>Mount a project folder, resume a Pi context, or start a clean session. Olympus wraps Pi with transcript history, model/provider state, and session stack in one desktop surface.</p>
+              <h1>Pick up the thread.</h1>
+              <p>Mount a project folder, resume a Pi context, or start a clean session.</p>
               <div class="home-actions" aria-label="Home quick actions">
-                <button class="primary-action" on:click={() => (activePane = 'chat')} disabled={!activeSession}>Resume active session</button>
-                <button on:click={pickProjectAndCreate}>Open project folder</button>
-                <button on:click={() => createSession()}>New local session</button>
+                <button class="primary-action" on:click={() => (activePane = 'chat')} disabled={!activeSession}>Resume session</button>
+                <button on:click={pickProjectAndCreate}>Open folder</button>
+                <button on:click={() => createSession()}>New session</button>
               </div>
             </section>
-
             <section class="home-metrics" aria-label="Workspace overview">
               {#each homeStats as stat}
                 <article>
@@ -718,9 +831,43 @@
                 </article>
               {/each}
             </section>
+          </div>
 
-            <section class="recent-card">
-              <div class="panel-head"><span>Recent work</span><small>{recentSessions.length} entries</small></div>
+        {:else}
+          <div class="tool-card__body">
+            <div class="placeholder-copy">
+              <p class="eyebrow">{active.key} / {active.label}</p>
+              <h1>{active.description}</h1>
+              <p>This surface will grow into a practical inspector for Pi, project state, permissions, and local tools.</p>
+            </div>
+          </div>
+        {/if}
+      </div>
+
+      <!-- Right info card -->
+      {#if infoCardVisible && (activePane === 'chat' || activePane === 'home')}
+        <div class="tool-card info-card">
+          <div class="tool-card__head">
+            <span class="tool-card__label">{activePane === 'chat' ? 'Pi wrapper' : 'Recent work'}</span>
+            <div class="tool-card__actions">
+              {#if activePane === 'chat'}
+                <small class="pi-state" class:streaming={activeSession?.status === 'streaming'}>{activeSession?.status ?? 'offline'}</small>
+              {/if}
+            </div>
+          </div>
+          {#if activePane === 'chat'}
+            <div class="tool-card__body info-body">
+              <div class="meters">
+                {#each piRuntimeFacts as fact}
+                  <button class="meter-button" on:click={() => openConfigChooser(fact.key)}>
+                    <span>{fact.label}</span><strong>{fact.value}</strong><small>{fact.note}</small>
+                  </button>
+                {/each}
+              </div>
+            </div>
+          {:else if activePane === 'home'}
+            <div class="tool-card__body info-body">
+              <div class="panel-head"><span class="eyebrow">Sessions</span><small>{recentSessions.length} entries</small></div>
               {#if recentSessions.length}
                 <div class="recent-list">
                   {#each recentSessions as session}
@@ -733,158 +880,54 @@
                   {/each}
                 </div>
               {:else}
-                <p class="empty-note">No sessions yet. Start one and it will appear here.</p>
+                <p class="empty-note">No sessions yet.</p>
               {/if}
-            </section>
-          </div>
-        {:else}
-          <div class="placeholder-copy">
-            <p class="eyebrow">{active.key} / {active.label}</p>
-            <h1>{active.description}</h1>
-            <p>This surface will grow into a practical inspector for Pi, project state, permissions, and local tools. The shell is intentionally quiet until there is real state to show.</p>
-          </div>
-        {/if}
-
-        {#if activePane === 'chat' && activeChooser}
-          <section class="config-popover panel" aria-label="Pi configuration chooser">
-            <div class="panel-head">
-              <span>Switch {activeChooser}</span>
-              <button on:click={() => (activeChooser = null)}>Close</button>
             </div>
-            {#if activeChooser === 'thinking'}
-              <div class="choice-grid compact">
-                {#each thinkingLevels as level}
-                  <button class:chosen={level === activeSession?.thinking_level} on:click={() => selectThinking(level)}>
-                    <strong>{level}</strong>
-                  </button>
-                {/each}
-              </div>
-            {:else if modelLoading}
-              <p class="empty-note">Loading Pi model registry…</p>
-            {:else if activeChooser === 'provider'}
-              <div class="choice-grid compact">
-                {#each providerCounts as option}
-                  <button class:chosen={option.provider === activeSession?.provider} on:click={() => selectProvider(option.provider)}>
-                    <strong>{option.provider}</strong>
-                    <small>{option.count} models available</small>
-                  </button>
-                {/each}
-              </div>
-            {:else}
-              <input class="model-search" bind:value={modelFilter} placeholder={`Filter ${activeSession?.provider ?? 'current provider'} models…`} />
-              {#if activeProviderModels.length && !modelFilter}
-                <p class="chooser-hint">Showing {activeProviderModels.length} models for {activeSession?.provider}.</p>
-              {:else if !activeProviderModels.length}
-                <p class="chooser-hint">No models found for the current provider yet.</p>
-              {/if}
-              <div class="choice-grid models">
-                {#each filteredModels as model}
-                  <button class:chosen={model.provider === activeSession?.provider && model.id === activeSession?.model_id} on:click={() => selectModel(model)}>
-                    <strong>{model.id}</strong>
-                    <small>{model.provider} · ctx {model.context} · out {model.max_output} · thinking {model.reasoning ? 'yes' : 'no'}</small>
-                  </button>
-                {/each}
-              </div>
-            {/if}
-          </section>
-        {/if}
-
-        {#if draft.startsWith('/')}
-          <section class="slash-menu panel" aria-label="Pi slash commands">
-            {#if visibleCommands.length}
-              {#each visibleCommands as command}
-                <button on:click={() => chooseCommand(command)}>
-                  <strong>/{command.name}</strong>
-                  <small>
-                    {command.description || 'no description'}
-                    <em class="cmd-source cmd-{command.source}">{command.source}{command.location ? ` · ${command.location}` : ''}</em>
-                  </small>
-                </button>
-              {/each}
-            {:else}
-              <p class="empty-note">No matching commands. Type to fuzzy-filter.</p>
-            {/if}
-            <button class="slash-refresh" on:click={refreshCommandOptions} type="button">Refresh commands</button>
-          </section>
-        {/if}
-
-        {#if hotkeysOpen}
-          <section class="extension-dialog panel" aria-label="Keyboard shortcuts">
-            <div class="panel-head"><span>Keyboard shortcuts</span><button on:click={() => (hotkeysOpen = false)}>Close</button></div>
-            <ul class="hotkeys-list">
-              <li><kbd>Enter</kbd> Send prompt</li>
-              <li><kbd>/</kbd> Open command palette</li>
-              <li><kbd>Ctrl/⌘ +</kbd> / <kbd>Ctrl/⌘ -</kbd> Zoom in/out</li>
-              <li><kbd>Ctrl/⌘ 0</kbd> Reset zoom</li>
-            </ul>
-          </section>
-        {/if}
-
-        {#if extensionRequest}
-          <section class="extension-dialog panel" aria-label="Pi request">
-            <div class="panel-head"><span>{extensionRequest.request.title ?? extensionRequest.request.method}</span><button on:click={() => respondToExtensionRequest({ cancelled: true })}>Cancel</button></div>
-            {#if extensionRequest.request.method === 'confirm'}
-              <p>{extensionRequest.request.message}</p>
-              <div class="dialog-actions"><button on:click={() => respondToExtensionRequest({ confirmed: false })}>No</button><button class="primary-action" on:click={() => respondToExtensionRequest({ confirmed: true })}>Yes</button></div>
-            {:else if extensionRequest.request.method === 'select'}
-              <div class="choice-grid compact">
-                {#each extensionRequest.request.options ?? [] as option}
-                  <button on:click={() => respondToExtensionRequest({ value: option.value ?? option.id ?? option })}><strong>{option.label ?? option.name ?? option.value ?? option}</strong></button>
-                {/each}
-              </div>
-            {:else if extensionRequest.request.method === 'input'}
-              <input class="model-search" placeholder={extensionRequest.request.placeholder ?? ''} on:keydown={(event) => event.key === 'Enter' && respondToExtensionRequest({ value: (event.currentTarget as HTMLInputElement).value })} />
-            {:else}
-              <p>{JSON.stringify(extensionRequest.request)}</p>
-            {/if}
-          </section>
-        {/if}
-
-        {#if activePane === 'chat' && (nonPresetStatuses.length || aboveWidgets.length)}
-          <div class="pi-status-feed">
-            {#if nonPresetStatuses.length}
-              <div class="status-row">
-                {#each nonPresetStatuses as status}
-                  <span class="status-chip"><small>{status.key}</small><strong>{stripAnsi(status.text).trim()}</strong></span>
-                {/each}
-              </div>
-            {/if}
-            {#each aboveWidgets as widget (widget.key)}
-              <pre class="pi-widget" aria-label={`pi widget ${widget.key}`}>{widget.lines.map(stripAnsi).join('\n')}</pre>
-            {/each}
-          </div>
-        {/if}
-
-        <div class="command-dock">
-          <label for="prompt-input">Prompt</label>
-          <input id="prompt-input" bind:value={draft} placeholder={activeSession ? `Ask Pi in ${activeSession.name}…` : 'Create a session first…'} on:input={ensureCommandOptions} on:keydown={(event) => event.key === 'Enter' && send()} />
-          <button on:click={send}>Send</button>
+          {/if}
         </div>
-        {#if activePane === 'chat' && belowWidgets.length}
-          <div class="pi-status-feed below">
-            {#each belowWidgets as widget (widget.key)}
-              <pre class="pi-widget" aria-label={`pi widget ${widget.key}`}>{widget.lines.map(stripAnsi).join('\n')}</pre>
-            {/each}
-          </div>
-        {/if}
-        {#if error}<p class="error">{error}</p>{/if}
-      </section>
-
-      {#if activePane === 'chat'}
-        <aside class="inspector">
-          <section class="panel runtime-panel">
-            <div class="panel-head"><span>Pi wrapper</span><small>{activeSession?.status ?? 'offline'}</small></div>
-            <div class="meters">
-              {#each piRuntimeFacts as fact}
-                <button class="meter-button" on:click={() => openConfigChooser(fact.key)}>
-                  <span>{fact.label}</span><strong>{fact.value}</strong><small>{fact.note}</small>
-                </button>
-              {/each}
-            </div>
-          </section>
-        </aside>
       {/if}
+
     </div>
   </section>
+
+  <!-- Global overlays -->
+  {#if hotkeysOpen}
+    <section class="global-dialog panel" aria-label="Keyboard shortcuts">
+      <div class="panel-head"><span>Keyboard shortcuts</span><button on:click={() => (hotkeysOpen = false)}>Close</button></div>
+      <ul class="hotkeys-list">
+        <li><kbd>Enter</kbd> Send prompt</li>
+        <li><kbd>/</kbd> Open command palette</li>
+        <li><kbd>Ctrl/⌘ +</kbd> / <kbd>Ctrl/⌘ -</kbd> Zoom in/out</li>
+        <li><kbd>Ctrl/⌘ 0</kbd> Reset zoom</li>
+      </ul>
+    </section>
+  {/if}
+
+  {#if extensionRequest}
+    <section class="global-dialog panel" aria-label="Pi request">
+      <div class="panel-head">
+        <span>{extensionRequest.request.title ?? extensionRequest.request.method}</span>
+        <button on:click={() => respondToExtensionRequest({ cancelled: true })}>Cancel</button>
+      </div>
+      {#if extensionRequest.request.method === 'confirm'}
+        <p>{extensionRequest.request.message}</p>
+        <div class="dialog-actions">
+          <button on:click={() => respondToExtensionRequest({ confirmed: false })}>No</button>
+          <button class="primary-action" on:click={() => respondToExtensionRequest({ confirmed: true })}>Yes</button>
+        </div>
+      {:else if extensionRequest.request.method === 'select'}
+        <div class="choice-grid compact">
+          {#each extensionRequest.request.options ?? [] as option}
+            <button on:click={() => respondToExtensionRequest({ value: option.value ?? option.id ?? option })}><strong>{option.label ?? option.name ?? option.value ?? option}</strong></button>
+          {/each}
+        </div>
+      {:else if extensionRequest.request.method === 'input'}
+        <input class="model-search" placeholder={extensionRequest.request.placeholder ?? ''} on:keydown={(event) => event.key === 'Enter' && respondToExtensionRequest({ value: (event.currentTarget as HTMLInputElement).value })} />
+      {:else}
+        <p>{JSON.stringify(extensionRequest.request)}</p>
+      {/if}
+    </section>
+  {/if}
+
   <div class="fps-overlay">fps: {fps}</div>
 </main>
