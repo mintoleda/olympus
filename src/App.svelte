@@ -11,7 +11,7 @@
 
   const panes: Array<{ id: PaneId; label: string; key: string; description: string }> = [
     { id: 'home', label: 'Atrium', key: '01', description: 'A calm launch surface for Pi sessions, widgets, and command routing.' },
-    { id: 'chat', label: 'Sessions', key: '02', description: 'Live headless Pi conversations grouped by project.' },
+    { id: 'chat', label: 'Chat', key: '02', description: 'Live headless Pi conversations grouped by project.' },
     { id: 'widgets', label: 'Modules', key: '03', description: 'Sandboxed AI tools and local system telemetry.' },
     { id: 'search', label: 'Index', key: '04', description: 'A future global search plane for files, chats, commands, and widgets.' },
     { id: 'settings', label: 'Control', key: '05', description: 'Preferences, permissions, theme, layout, and platform details.' }
@@ -28,6 +28,7 @@
   let activeSessionId = '';
   let draft = '';
   let error = '';
+  let sessionsCollapsed = false;
   $: active = panes.find((pane) => pane.id === activePane) ?? panes[0];
   $: activeSession = sessions.find((session) => session.id === activeSessionId) ?? sessions[0];
   $: groupedSessions = Object.entries(
@@ -138,15 +139,27 @@
     <header class="masthead">
       <div><p class="kicker">Pi workspace</p><h1>{active.label}</h1></div>
       <div class="masthead-actions">
-        <button class="ghost-button primary-ghost" on:click={() => createSession()}>＋ New session</button>
         <button class="ghost-button quiet-ghost" on:click={pickProjectAndCreate}>Open project…</button>
+        <button class="ghost-button primary-ghost" on:click={() => createSession()}>＋ New session</button>
       </div>
     </header>
 
-    <div class="layout" class:chat-layout={activePane === 'chat'}>
+    <div class="layout" class:chat-layout={activePane === 'chat'} class:sessions-collapsed={activePane === 'chat' && sessionsCollapsed}>
       {#if activePane === 'chat'}
-        <aside class="project-tabs panel pane-pop">
-          <div class="panel-head"><span>Projects</span><div class="mini-actions"><button on:click={() => createSession()}>New</button><button class="quiet-mini" on:click={pickProjectAndCreate}>Open…</button></div></div>
+        {#if sessionsCollapsed}
+          <button class="sessions-peek panel pane-pop" on:click={() => (sessionsCollapsed = false)} aria-label="Expand sessions tab">
+            <span>Sessions</span><strong>{sessions.length}</strong>
+          </button>
+        {:else}
+          <aside class="project-tabs panel pane-pop">
+            <div class="panel-head">
+              <span>Projects</span>
+              <div class="mini-actions">
+                <button class="quiet-mini" on:click={pickProjectAndCreate}>Open…</button>
+                <button on:click={() => createSession()}>New</button>
+                <button class="quiet-mini icon-mini" on:click={() => (sessionsCollapsed = true)} aria-label="Minimize sessions tab">−</button>
+              </div>
+            </div>
           {#each groupedSessions as [project, projectSessions]}
             <p class="project-label">{project}</p>
             {#each projectSessions as session}
@@ -156,7 +169,8 @@
               </button>
             {/each}
           {/each}
-        </aside>
+          </aside>
+        {/if}
       {/if}
 
       <section class="hero panel chat-hero" class:home-hero={activePane === 'home'} class:panel-shift={activePane !== 'chat'}>
@@ -174,8 +188,8 @@
               <p>Olympus gives you a clean place to resume a project, create a fresh context, or send a prompt and move directly into chat.</p>
               <div class="home-actions" aria-label="Home quick actions">
                 <button class="primary-action" on:click={() => (activePane = 'chat')} disabled={!activeSession}>Continue where you left off ↗</button>
-                <button on:click={() => createSession()}>New local session</button>
                 <button on:click={pickProjectAndCreate}>Open project folder</button>
+                <button on:click={() => createSession()}>New local session</button>
               </div>
             </section>
 
