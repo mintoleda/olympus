@@ -328,22 +328,29 @@ input { color: var(--paper); outline: none; }
 
 .sessions-peek {
   display: grid;
-  place-items: center;
+  grid-template-rows: auto 1fr auto;
+  justify-items: center;
+  align-items: center;
   gap: 10px;
   height: 100%;
-  padding: 10px 6px;
+  padding: 18px 6px;
   color: var(--muted);
 }
 
 .sessions-peek span {
+  grid-row: 1;
+  display: block;
   writing-mode: vertical-rl;
   transform: rotate(180deg);
+  text-align: center;
   text-transform: uppercase;
   letter-spacing: 0.12em;
+  line-height: 1;
   font-size: 0.62rem;
 }
 
 .sessions-peek strong {
+  grid-row: 3;
   display: grid;
   place-items: center;
   width: 26px;
