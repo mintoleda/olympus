@@ -33,6 +33,7 @@ struct PiSession {
     pi_session_id: Option<String>,
     pi_session_file: Option<String>,
     model: Option<String>,
+    model_id: Option<String>,
     provider: Option<String>,
     thinking_level: Option<String>,
 }
@@ -46,6 +47,16 @@ struct SessionEvent {
 #[derive(Clone, Serialize)]
 struct SessionUpdateEvent {
     session: PiSession,
+}
+
+#[derive(Clone, Serialize)]
+struct PiModelOption {
+    provider: String,
+    id: String,
+    context: String,
+    max_output: String,
+    reasoning: bool,
+    images: bool,
 }
 
 #[derive(Clone)]
@@ -99,12 +110,20 @@ fn persist_store(app: &AppHandle, store: &SessionStore) {
 
 fn load_sessions(app: &AppHandle, store: &SessionStore) {
     let Ok(path) = sessions_path(app) else { return };
-    let Ok(json) = fs::read_to_string(path) else { return };
-    let Ok(sessions) = serde_json::from_str::<Vec<PiSession>>(&json) else { return };
+    let Ok(json) = fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(sessions) = serde_json::from_str::<Vec<PiSession>>(&json) else {
+        return;
+    };
     let mut max_suffix: u64 = 0;
     if let Ok(mut map) = store.sessions.lock() {
         for mut session in sessions {
-            if let Some(suffix) = session.id.strip_prefix("session-").and_then(|s| s.parse::<u64>().ok()) {
+            if let Some(suffix) = session
+                .id
+                .strip_prefix("session-")
+                .and_then(|s| s.parse::<u64>().ok())
+            {
                 if suffix > max_suffix {
                     max_suffix = suffix;
                 }
@@ -206,24 +225,44 @@ fn model_label(data: &Value) -> Option<String> {
         return Some(model);
     }
 
-    let model = data.get("model").or_else(|| data.pointer("/config/model"))?;
+    let model = data
+        .get("model")
+        .or_else(|| data.pointer("/config/model"))?;
     value_string(model.get("name"))
         .or_else(|| value_string(model.get("id")))
         .or_else(|| value_string(model.get("model")))
 }
 
+fn model_id_label(data: &Value) -> Option<String> {
+    if let Some(model) = value_string(data.get("model").or_else(|| data.pointer("/config/model"))) {
+        return Some(model);
+    }
+
+    let model = data
+        .get("model")
+        .or_else(|| data.pointer("/config/model"))?;
+    value_string(model.get("id"))
+        .or_else(|| value_string(model.get("model")))
+        .or_else(|| value_string(model.get("name")))
+}
+
 fn provider_label(data: &Value) -> Option<String> {
-    value_string(data.get("provider").or_else(|| data.pointer("/config/provider")))
-        .or_else(|| value_string(data.pointer("/model/provider")))
-        .or_else(|| value_string(data.pointer("/config/model/provider")))
-        .or_else(|| value_string(data.pointer("/model/api")))
+    value_string(
+        data.get("provider")
+            .or_else(|| data.pointer("/config/provider")),
+    )
+    .or_else(|| value_string(data.pointer("/model/provider")))
+    .or_else(|| value_string(data.pointer("/config/model/provider")))
+    .or_else(|| value_string(data.pointer("/model/api")))
 }
 
 fn handle_state_response(app: &AppHandle, session_id: &str, data: &Value) {
     let pi_session_id = value_string(data.get("sessionId").or_else(|| data.get("session_id")));
-    let pi_session_file = value_string(data.get("sessionFile").or_else(|| data.get("session_file")));
+    let pi_session_file =
+        value_string(data.get("sessionFile").or_else(|| data.get("session_file")));
     let session_name = value_string(data.get("sessionName").or_else(|| data.get("session_name")));
     let model = model_label(data);
+    let model_id = model_id_label(data);
     let provider = provider_label(data);
     let thinking_level = value_string(
         data.get("thinkingLevel")
@@ -248,6 +287,9 @@ fn handle_state_response(app: &AppHandle, session_id: &str, data: &Value) {
             if let Some(model) = model {
                 session.model = Some(model);
             }
+            if let Some(model_id) = model_id {
+                session.model_id = Some(model_id);
+            }
             if let Some(provider) = provider {
                 session.provider = Some(provider);
             }
@@ -266,11 +308,17 @@ fn handle_state_response(app: &AppHandle, session_id: &str, data: &Value) {
     }
 }
 
-fn request_pi_state(runtime: &RunningSession, session_id: &str) -> Result<(), String> {
+fn write_rpc(runtime: &RunningSession, request: Value) -> Result<(), String> {
     let mut stdin = runtime.stdin.lock().map_err(|_| "Pi stdin lock poisoned")?;
-    let request = serde_json::json!({"id": format!("{session_id}-state-{}", now_ms()), "type": "get_state"});
     writeln!(stdin, "{request}").map_err(|err| err.to_string())?;
     stdin.flush().map_err(|err| err.to_string())
+}
+
+fn request_pi_state(runtime: &RunningSession, session_id: &str) -> Result<(), String> {
+    write_rpc(
+        runtime,
+        serde_json::json!({"id": format!("{session_id}-state-{}", now_ms()), "type": "get_state"}),
+    )
 }
 
 fn spawn_pi(app: AppHandle, session_id: String) -> Result<RunningSession, String> {
@@ -287,12 +335,18 @@ fn spawn_pi(app: AppHandle, session_id: String) -> Result<RunningSession, String
     }
 
     let (project_path, resume_target) = {
-        let mut sessions = store.sessions.lock().map_err(|_| "session store poisoned")?;
+        let mut sessions = store
+            .sessions
+            .lock()
+            .map_err(|_| "session store poisoned")?;
         let session = sessions.get_mut(&session_id).ok_or("session not found")?;
         session.status = "starting".into();
         (
             session.project_path.clone(),
-            session.pi_session_file.clone().or_else(|| session.pi_session_id.clone()),
+            session
+                .pi_session_file
+                .clone()
+                .or_else(|| session.pi_session_id.clone()),
         )
     };
 
@@ -301,9 +355,14 @@ fn spawn_pi(app: AppHandle, session_id: String) -> Result<RunningSession, String
     if let Some(target) = resume_target {
         command.arg("--session").arg(target);
     }
-    command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
-    let mut child = command.spawn().map_err(|err| format!("Could not start Pi RPC: {err}"))?;
+    let mut child = command
+        .spawn()
+        .map_err(|err| format!("Could not start Pi RPC: {err}"))?;
     let stdin = child.stdin.take().ok_or("Pi stdin unavailable")?;
     let stdout = child.stdout.take().ok_or("Pi stdout unavailable")?;
     let stderr = child.stderr.take();
@@ -328,7 +387,9 @@ fn spawn_pi(app: AppHandle, session_id: String) -> Result<RunningSession, String
         let reader = BufReader::new(stdout);
 
         for line in reader.lines().map_while(Result::ok) {
-            let Ok(event) = serde_json::from_str::<Value>(&line) else { continue };
+            let Ok(event) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
             match event.get("type").and_then(Value::as_str) {
                 Some("response") => {
                     if event.get("command").and_then(Value::as_str) == Some("get_state") {
@@ -365,7 +426,12 @@ fn spawn_pi(app: AppHandle, session_id: String) -> Result<RunningSession, String
                                 current_message_id = format!("{reader_session_id}-a-{}", now_ms());
                             }
                             full_response.push_str(delta);
-                            append_assistant_delta(&reader_app, &reader_session_id, &current_message_id, delta);
+                            append_assistant_delta(
+                                &reader_app,
+                                &reader_session_id,
+                                &current_message_id,
+                                delta,
+                            );
                         }
                     }
                 }
@@ -373,7 +439,12 @@ fn spawn_pi(app: AppHandle, session_id: String) -> Result<RunningSession, String
                     if current_message_id.is_empty() {
                         current_message_id = format!("{reader_session_id}-a-{}", now_ms());
                     }
-                    finalize_assistant(&reader_app, &reader_session_id, &current_message_id, full_response.clone());
+                    finalize_assistant(
+                        &reader_app,
+                        &reader_session_id,
+                        &current_message_id,
+                        full_response.clone(),
+                    );
                     current_message_id.clear();
                     full_response.clear();
                 }
@@ -407,7 +478,11 @@ fn spawn_pi(app: AppHandle, session_id: String) -> Result<RunningSession, String
 }
 
 #[tauri::command]
-fn create_session(project_path: Option<String>, app: AppHandle, store: State<'_, SessionStore>) -> Result<PiSession, String> {
+fn create_session(
+    project_path: Option<String>,
+    app: AppHandle,
+    store: State<'_, SessionStore>,
+) -> Result<PiSession, String> {
     let id_num = store.counter.fetch_add(1, Ordering::Relaxed) + 1;
     let project_path = project_path.unwrap_or_else(|| {
         std::env::current_dir()
@@ -423,23 +498,32 @@ fn create_session(project_path: Option<String>, app: AppHandle, store: State<'_,
         messages: vec![ChatMessage {
             id: format!("session-{id_num}-hello"),
             role: "assistant".into(),
-            content: "Pi session ready. Olympus will resume this conversation by its Pi session id.".into(),
+            content:
+                "Pi session ready. Olympus will resume this conversation by its Pi session id."
+                    .into(),
             timestamp: now_ms(),
         }],
         session_dir: String::new(),
         pi_session_id: None,
         pi_session_file: None,
         model: None,
+        model_id: None,
         provider: None,
         thinking_level: None,
     };
 
     {
-        let mut sessions = store.sessions.lock().map_err(|_| "session store poisoned")?;
+        let mut sessions = store
+            .sessions
+            .lock()
+            .map_err(|_| "session store poisoned")?;
         sessions.insert(session.id.clone(), session.clone());
         save_sessions(&app, &sessions)?;
     }
-    *store.active.lock().map_err(|_| "active session lock poisoned")? = Some(session.id.clone());
+    *store
+        .active
+        .lock()
+        .map_err(|_| "active session lock poisoned")? = Some(session.id.clone());
     spawn_pi(app, session.id.clone())?;
     Ok(session)
 }
@@ -450,45 +534,169 @@ fn spawn_pi_unit(app: AppHandle, session_id: String) -> Result<(), String> {
 
 #[tauri::command]
 fn list_sessions(app: AppHandle, store: State<'_, SessionStore>) -> Result<Vec<PiSession>, String> {
-    if store.sessions.lock().map_err(|_| "session store poisoned")?.is_empty() {
+    if store
+        .sessions
+        .lock()
+        .map_err(|_| "session store poisoned")?
+        .is_empty()
+    {
         load_sessions(&app, &store);
     }
 
-    let mut sessions: Vec<_> = store.sessions.lock().map_err(|_| "session store poisoned")?.values().cloned().collect();
-    let active = store.active.lock().map_err(|_| "active session lock poisoned")?.clone();
-    sessions.sort_by(|a, b| a.project_path.cmp(&b.project_path).then(a.name.cmp(&b.name)));
+    let mut sessions: Vec<_> = store
+        .sessions
+        .lock()
+        .map_err(|_| "session store poisoned")?
+        .values()
+        .cloned()
+        .collect();
+    let active = store
+        .active
+        .lock()
+        .map_err(|_| "active session lock poisoned")?
+        .clone();
+    sessions.sort_by(|a, b| {
+        a.project_path
+            .cmp(&b.project_path)
+            .then(a.name.cmp(&b.name))
+    });
     for session in &mut sessions {
-        if session.status != "streaming" && session.status != "starting" && session.status != "error" {
-            session.status = if Some(&session.id) == active.as_ref() { "active" } else { "idle" }.into();
+        if session.status != "streaming"
+            && session.status != "starting"
+            && session.status != "error"
+        {
+            session.status = if Some(&session.id) == active.as_ref() {
+                "active"
+            } else {
+                "idle"
+            }
+            .into();
         }
     }
     Ok(sessions)
 }
 
 #[tauri::command]
-fn switch_session(id: String, app: AppHandle, store: State<'_, SessionStore>) -> Result<(), String> {
-    if !store.sessions.lock().map_err(|_| "session store poisoned")?.contains_key(&id) {
+fn switch_session(
+    id: String,
+    app: AppHandle,
+    store: State<'_, SessionStore>,
+) -> Result<(), String> {
+    if !store
+        .sessions
+        .lock()
+        .map_err(|_| "session store poisoned")?
+        .contains_key(&id)
+    {
         return Err("session not found".into());
     }
-    *store.active.lock().map_err(|_| "active session lock poisoned")? = Some(id.clone());
+    *store
+        .active
+        .lock()
+        .map_err(|_| "active session lock poisoned")? = Some(id.clone());
     spawn_pi_unit(app, id)
 }
 
 #[tauri::command]
+fn list_pi_models(
+    id: String,
+    store: State<'_, SessionStore>,
+) -> Result<Vec<PiModelOption>, String> {
+    let project_path = {
+        let sessions = store
+            .sessions
+            .lock()
+            .map_err(|_| "session store poisoned")?;
+        sessions
+            .get(&id)
+            .map(|session| session.project_path.clone())
+    };
+
+    let mut command = Command::new("pi");
+    command
+        .arg("--list-models")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(project_path) = project_path {
+        command.current_dir(project_path);
+    }
+
+    let output = command
+        .output()
+        .map_err(|err| format!("Could not list Pi models: {err}"))?;
+    let text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mut models = Vec::new();
+    for line in text.lines() {
+        let columns: Vec<_> = line.split_whitespace().collect();
+        if columns.len() < 6 || columns[0] == "provider" {
+            continue;
+        }
+        models.push(PiModelOption {
+            provider: columns[0].to_string(),
+            id: columns[1].to_string(),
+            context: columns[2].to_string(),
+            max_output: columns[3].to_string(),
+            reasoning: columns[4] == "yes",
+            images: columns[5] == "yes",
+        });
+    }
+
+    if models.is_empty() {
+        return Err("Pi returned no available models".into());
+    }
+    Ok(models)
+}
+
+#[tauri::command]
+fn set_pi_model(
+    id: String,
+    provider: String,
+    model_id: String,
+    app: AppHandle,
+) -> Result<(), String> {
+    let runtime = spawn_pi(app, id.clone())?;
+    write_rpc(
+        &runtime,
+        serde_json::json!({"id": format!("{id}-set-model-{}", now_ms()), "type": "set_model", "provider": provider, "modelId": model_id}),
+    )?;
+    request_pi_state(&runtime, &id)
+}
+
+#[tauri::command]
+fn set_pi_thinking_level(id: String, level: String, app: AppHandle) -> Result<(), String> {
+    let runtime = spawn_pi(app, id.clone())?;
+    write_rpc(
+        &runtime,
+        serde_json::json!({"id": format!("{id}-set-thinking-{}", now_ms()), "type": "set_thinking_level", "level": level}),
+    )?;
+    request_pi_state(&runtime, &id)
+}
+
+#[tauri::command]
 fn close_session(id: String, app: AppHandle, store: State<'_, SessionStore>) -> Result<(), String> {
-    if let Some(runtime) = store.runtimes.lock().map_err(|_| "runtime store poisoned")?.remove(&id) {
+    if let Some(runtime) = store
+        .runtimes
+        .lock()
+        .map_err(|_| "runtime store poisoned")?
+        .remove(&id)
+    {
         if let Ok(mut child) = runtime.child.lock() {
             let _ = child.kill();
             let _ = child.wait();
         }
     }
     if let Ok(mut sessions) = store.sessions.lock() {
-        if let Some(session) = sessions.get_mut(&id) {
-            session.status = "idle".into();
-        }
+        sessions.remove(&id);
         save_sessions(&app, &sessions)?;
     }
-    let mut active = store.active.lock().map_err(|_| "active session lock poisoned")?;
+    let mut active = store
+        .active
+        .lock()
+        .map_err(|_| "active session lock poisoned")?;
     if active.as_ref() == Some(&id) {
         *active = None;
     }
@@ -496,7 +704,12 @@ fn close_session(id: String, app: AppHandle, store: State<'_, SessionStore>) -> 
 }
 
 #[tauri::command]
-fn send_message(id: String, content: String, app: AppHandle, store: State<'_, SessionStore>) -> Result<(), String> {
+fn send_message(
+    id: String,
+    content: String,
+    app: AppHandle,
+    store: State<'_, SessionStore>,
+) -> Result<(), String> {
     let user_message = ChatMessage {
         id: format!("{id}-u-{}", now_ms()),
         role: "user".into(),
@@ -505,7 +718,10 @@ fn send_message(id: String, content: String, app: AppHandle, store: State<'_, Se
     };
 
     {
-        let mut sessions = store.sessions.lock().map_err(|_| "session store poisoned")?;
+        let mut sessions = store
+            .sessions
+            .lock()
+            .map_err(|_| "session store poisoned")?;
         let session = sessions.get_mut(&id).ok_or("session not found")?;
         if session.status == "streaming" {
             return Err("session is already streaming".into());
@@ -518,10 +734,10 @@ fn send_message(id: String, content: String, app: AppHandle, store: State<'_, Se
 
     let runtime = spawn_pi(app, id.clone())?;
 
-    let mut stdin = runtime.stdin.lock().map_err(|_| "Pi stdin lock poisoned")?;
-    let request = serde_json::json!({"id": format!("{id}-prompt-{}", now_ms()), "type": "prompt", "message": content});
-    writeln!(stdin, "{request}").map_err(|err| err.to_string())?;
-    stdin.flush().map_err(|err| err.to_string())?;
+    write_rpc(
+        &runtime,
+        serde_json::json!({"id": format!("{id}-prompt-{}", now_ms()), "type": "prompt", "message": content}),
+    )?;
     Ok(())
 }
 
@@ -545,7 +761,16 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(SessionStore::default())
-        .invoke_handler(tauri::generate_handler![create_session, list_sessions, switch_session, close_session, send_message])
+        .invoke_handler(tauri::generate_handler![
+            create_session,
+            list_sessions,
+            switch_session,
+            list_pi_models,
+            set_pi_model,
+            set_pi_thinking_level,
+            close_session,
+            send_message
+        ])
         .setup(|app| {
             let handle = app.handle().clone();
             let store = handle.state::<SessionStore>();

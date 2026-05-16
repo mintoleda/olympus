@@ -19,7 +19,7 @@
   } from './animations';
   import type { Scope } from 'animejs';
 
-  type PaneId = 'home' | 'chat' | 'widgets' | 'search' | 'settings';
+  type PaneId = 'home' | 'chat' | 'search' | 'settings';
   type ChatMessage = { id: string; role: 'user' | 'assistant' | 'status'; content: string; timestamp: number };
   type PiSession = {
     id: string;
@@ -30,17 +30,21 @@
     pi_session_id?: string | null;
     pi_session_file?: string | null;
     model?: string | null;
+    model_id?: string | null;
     provider?: string | null;
     thinking_level?: string | null;
   };
   type SessionEvent = { session_id: string; message: ChatMessage };
   type SessionUpdateEvent = { session: PiSession };
+  type PiModelOption = { provider: string; id: string; context: string; max_output: string; reasoning: boolean; images: boolean };
+  type ConfigChooser = 'provider' | 'model' | 'thinking' | null;
+
+  const thinkingLevels = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh'];
 
   const panes: Array<{ id: PaneId; label: string; key: string; description: string }> = [
     { id: 'home', label: 'Home', key: 'HM', description: 'Resume recent work, open a folder, or start a clean Pi context.' },
-    { id: 'chat', label: 'Sessions', key: 'SE', description: 'Project-bound Pi conversations with local transcript history.' },
-    { id: 'widgets', label: 'Pi', key: 'PI', description: 'Live Pi configuration, provider, model, thinking level, and resume identity.' },
-    { id: 'search', label: 'Find', key: 'FD', description: 'A planned index for sessions, files, commands, and widgets.' },
+    { id: 'chat', label: 'Chat', key: 'CH', description: 'Project-bound Pi conversations with model/provider controls.' },
+    { id: 'search', label: 'Find', key: 'FD', description: 'A planned index for sessions, files, commands, and Pi context.' },
     { id: 'settings', label: 'Settings', key: 'ST', description: 'Preferences, permissions, theme, layout, and platform details.' }
   ];
 
@@ -50,6 +54,10 @@
   let draft = '';
   let error = '';
   let sessionsCollapsed = false;
+  let activeChooser: ConfigChooser = null;
+  let modelOptions: PiModelOption[] = [];
+  let modelLoading = false;
+  let modelFilter = '';
   let rootEl: HTMLElement;
   let animationScope: Scope | undefined;
   let animationReady = false;
@@ -73,9 +81,9 @@
     .slice(0, 6);
   $: activeProjectName = activeSession?.project_path.split('/').filter(Boolean).at(-1) ?? 'workspace';
   $: piRuntimeFacts = [
-    { label: 'Provider', value: activeSession?.provider ?? 'detecting', note: 'current Pi backend' },
-    { label: 'Model', value: activeSession?.model ?? 'waiting', note: 'selected model' },
-    { label: 'Thinking', value: activeSession?.thinking_level ?? 'default', note: 'reasoning level' }
+    { key: 'provider' as const, label: 'Provider', value: activeSession?.provider ?? 'detecting', note: 'current Pi backend' },
+    { key: 'model' as const, label: 'Model', value: activeSession?.model ?? 'waiting', note: activeSession?.model_id ?? 'selected model' },
+    { key: 'thinking' as const, label: 'Thinking', value: activeSession?.thinking_level ?? 'default', note: 'reasoning level' }
   ];
   $: piWrapperDetails = [
     ...piRuntimeFacts,
@@ -83,6 +91,16 @@
     { label: 'Session file', value: activeSession?.pi_session_file ?? 'managed by Pi', note: 'local transcript source' },
     { label: 'Status', value: activeSession?.status ?? 'offline', note: activeSession ? 'RPC connection state' : 'create a session to start Pi' }
   ];
+  $: providers = Array.from(new Set(modelOptions.map((model) => model.provider))).sort();
+  $: providerCounts = providers.map((provider) => ({
+    provider,
+    count: modelOptions.filter((model) => model.provider === provider).length
+  }));
+  $: activeProviderModels = modelOptions.filter((model) => model.provider === activeSession?.provider);
+  $: modelSearch = modelFilter.trim().toLowerCase();
+  $: filteredModels = modelOptions
+    .filter((model) => !modelSearch || `${model.provider}/${model.id}`.toLowerCase().includes(modelSearch))
+    .slice(0, 160);
   $: homeStats = [
     { label: 'Sessions', value: String(sessions.length).padStart(2, '0'), note: sessions.length === 1 ? 'context mounted' : 'contexts mounted' },
     { label: 'Project', value: activeProjectName, note: activeSession?.status ?? 'waiting' },
@@ -196,6 +214,50 @@
     if (ok !== undefined) draft = '';
   }
 
+  async function ensureModelOptions() {
+    if (!activeSession || modelLoading || modelOptions.length) return;
+    modelLoading = true;
+    const models = await runAction(() => invoke<PiModelOption[]>('list_pi_models', { id: activeSession!.id }));
+    if (models) modelOptions = models;
+    modelLoading = false;
+  }
+
+  async function openConfigChooser(kind: Exclude<ConfigChooser, null>) {
+    activeChooser = activeChooser === kind ? null : kind;
+    modelFilter = '';
+    if (kind === 'provider' || kind === 'model') await ensureModelOptions();
+  }
+
+  async function selectProvider(provider: string) {
+    if (!activeSession) return;
+    const preferredId = activeSession.model_id ?? activeSession.model?.toLowerCase();
+    const model = modelOptions.find((item) => item.provider === provider && item.id === preferredId) ?? modelOptions.find((item) => item.provider === provider);
+    if (!model) return;
+    activeChooser = null;
+    const ok = await runAction(() => invoke('set_pi_model', { id: activeSession!.id, provider: model.provider, modelId: model.id }));
+    if (ok !== undefined) {
+      sessions = sessions.map((session) => session.id === activeSession!.id ? { ...session, provider: model.provider, model: model.id, model_id: model.id, status: 'updating' } : session);
+    }
+  }
+
+  async function selectModel(model: PiModelOption) {
+    if (!activeSession) return;
+    activeChooser = null;
+    const ok = await runAction(() => invoke('set_pi_model', { id: activeSession!.id, provider: model.provider, modelId: model.id }));
+    if (ok !== undefined) {
+      sessions = sessions.map((session) => session.id === activeSession!.id ? { ...session, provider: model.provider, model: model.id, model_id: model.id, status: 'updating' } : session);
+    }
+  }
+
+  async function selectThinking(level: string) {
+    if (!activeSession) return;
+    activeChooser = null;
+    const ok = await runAction(() => invoke('set_pi_thinking_level', { id: activeSession!.id, level }));
+    if (ok !== undefined) {
+      sessions = sessions.map((session) => session.id === activeSession!.id ? { ...session, thinking_level: level, status: 'updating' } : session);
+    }
+  }
+
   onMount(() => {
     let unlisteners: Array<() => void> = [];
     let disposed = false;
@@ -265,7 +327,7 @@
     <div class="product-mark"><span>OL</span><small>Olympus</small></div>
     <nav class="pane-tabs">
       {#each panes as pane}
-        <button class:active={pane.id === activePane} on:click={() => (activePane = pane.id)}>
+        <button class:active={pane.id === activePane} on:click={() => { activePane = pane.id; if (pane.id !== 'chat') activeChooser = null; }}>
           <b>{pane.key}</b><span>{pane.label}</span>
         </button>
       {/each}
@@ -301,10 +363,12 @@
             {#each groupedSessions as [project, projectSessions]}
               <p class="project-label">{project}</p>
               {#each projectSessions as session}
-                <button class:chosen={session.id === activeSession?.id} on:click={() => switchSession(session.id)}>
-                  <strong>{session.name}</strong><small>{session.project_path}</small><em>{session.status}</em>
-                  <span class="close" role="button" tabindex="0" on:click|stopPropagation={() => closeSession(session.id)} on:keydown|stopPropagation={(event) => (event.key === 'Enter' || event.key === ' ') && closeSession(session.id)}>×</span>
-                </button>
+                <div class="session-row" class:chosen={session.id === activeSession?.id}>
+                  <button class="session-select" on:click={() => switchSession(session.id)}>
+                    <strong>{session.name}</strong><small>{session.project_path}</small><em>{session.status}</em>
+                  </button>
+                  <button class="close" aria-label={`Close ${session.name}`} on:click={() => closeSession(session.id)}>×</button>
+                </div>
               {/each}
             {/each}
           </aside>
@@ -366,34 +430,55 @@
               {/if}
             </section>
           </div>
-        {:else if activePane === 'widgets'}
-          <div class="pi-wrapper-surface">
-            <section class="pi-hero">
-              <p class="eyebrow">Pi wrapper</p>
-              <h1>{activeSession?.model ?? 'Waiting for Pi state'}</h1>
-              <p>Olympus is a desktop skin over Pi: it tracks the active provider, selected model, thinking level, resume id, and live RPC status for the current project-bound session.</p>
-              <div class="pi-badges" aria-label="Current Pi configuration">
-                <span>{activeSession?.provider ?? 'provider pending'}</span>
-                <span>{activeSession?.thinking_level ?? 'default thinking'}</span>
-                <span>{activeSession?.status ?? 'offline'}</span>
-              </div>
-            </section>
-            <section class="pi-detail-grid" aria-label="Pi session details">
-              {#each piWrapperDetails as detail}
-                <article>
-                  <span>{detail.label}</span>
-                  <strong>{detail.value}</strong>
-                  <small>{detail.note}</small>
-                </article>
-              {/each}
-            </section>
-          </div>
         {:else}
           <div class="placeholder-copy">
             <p class="eyebrow">{active.key} / {active.label}</p>
             <h1>{active.description}</h1>
             <p>This surface will grow into a practical inspector for Pi, project state, permissions, and local tools. The shell is intentionally quiet until there is real state to show.</p>
           </div>
+        {/if}
+
+        {#if activePane === 'chat' && activeChooser}
+          <section class="config-popover panel" aria-label="Pi configuration chooser">
+            <div class="panel-head">
+              <span>Switch {activeChooser}</span>
+              <button on:click={() => (activeChooser = null)}>Close</button>
+            </div>
+            {#if activeChooser === 'thinking'}
+              <div class="choice-grid compact">
+                {#each thinkingLevels as level}
+                  <button class:chosen={level === activeSession?.thinking_level} on:click={() => selectThinking(level)}>
+                    <strong>{level}</strong>
+                    <small>{level === 'off' ? 'no reasoning budget' : 'reasoning depth'}</small>
+                  </button>
+                {/each}
+              </div>
+            {:else if modelLoading}
+              <p class="empty-note">Loading Pi model registry…</p>
+            {:else if activeChooser === 'provider'}
+              <div class="choice-grid compact">
+                {#each providerCounts as option}
+                  <button class:chosen={option.provider === activeSession?.provider} on:click={() => selectProvider(option.provider)}>
+                    <strong>{option.provider}</strong>
+                    <small>{option.count} models available</small>
+                  </button>
+                {/each}
+              </div>
+            {:else}
+              <input class="model-search" bind:value={modelFilter} placeholder="Filter models by provider or id…" />
+              {#if activeProviderModels.length && !modelFilter}
+                <p class="chooser-hint">Showing all models. Current provider has {activeProviderModels.length} options.</p>
+              {/if}
+              <div class="choice-grid models">
+                {#each filteredModels as model}
+                  <button class:chosen={model.provider === activeSession?.provider && model.id === activeSession?.model_id} on:click={() => selectModel(model)}>
+                    <strong>{model.id}</strong>
+                    <small>{model.provider} · ctx {model.context} · out {model.max_output} · thinking {model.reasoning ? 'yes' : 'no'}</small>
+                  </button>
+                {/each}
+              </div>
+            {/if}
+          </section>
         {/if}
 
         <div class="command-dock">
@@ -404,21 +489,25 @@
         {#if error}<p class="error">{error}</p>{/if}
       </section>
 
-      <aside class="inspector">
-        <section class="panel runtime-panel">
-          <div class="panel-head"><span>Pi wrapper</span><small>{activeSession?.status ?? 'offline'}</small></div>
-          <div class="meters">
-            {#each piRuntimeFacts as fact}
-              <article><span>{fact.label}</span><strong>{fact.value}</strong><small>{fact.note}</small></article>
-            {/each}
-          </div>
-        </section>
-        <section class="panel context-card">
-          <p class="eyebrow">Context</p>
-          <h2>{activeSession?.name ?? 'No session'}</h2>
-          <p>{activeSession?.project_path ?? 'Create a project-bound Pi session.'}</p>
-        </section>
-      </aside>
+      {#if activePane === 'chat'}
+        <aside class="inspector">
+          <section class="panel runtime-panel">
+            <div class="panel-head"><span>Pi wrapper</span><small>{activeSession?.status ?? 'offline'}</small></div>
+            <div class="meters">
+              {#each piRuntimeFacts as fact}
+                <button class="meter-button" on:click={() => openConfigChooser(fact.key)}>
+                  <span>{fact.label}</span><strong>{fact.value}</strong><small>{fact.note}</small>
+                </button>
+              {/each}
+            </div>
+          </section>
+          <section class="panel context-card">
+            <p class="eyebrow">Context</p>
+            <h2>{activeSession?.name ?? 'No session'}</h2>
+            <p>{activeSession?.project_path ?? 'Create a project-bound Pi session.'}</p>
+          </section>
+        </aside>
+      {/if}
     </div>
   </section>
 </main>
