@@ -59,6 +59,7 @@
   let modelLoading = false;
   let modelFilter = '';
   let rootEl: HTMLElement;
+  let chatLogEl: HTMLElement;
   let animationScope: Scope | undefined;
   let animationReady = false;
   let lastAnimatedPane: PaneId = activePane;
@@ -137,7 +138,10 @@
   }
   $: if (animationReady && rootEl && activeMessageCount > lastAnimatedMessageCount) {
     lastAnimatedMessageCount = activeMessageCount;
-    tick().then(() => animateLatestMessage(rootEl));
+    tick().then(() => {
+      animateLatestMessage(rootEl);
+      scrollChatToBottom();
+    });
   }
   $: if (animationReady && rootEl && activeSession?.status && activeSession.status !== lastAnimatedStatus) {
     lastAnimatedStatus = activeSession.status;
@@ -153,6 +157,11 @@
 
   function latestTimestamp(session: PiSession): number {
     return session.messages.reduce((max, message) => Math.max(max, message.timestamp), 0);
+  }
+
+  async function scrollChatToBottom() {
+    await tick();
+    if (chatLogEl) chatLogEl.scrollTop = chatLogEl.scrollHeight;
   }
 
   async function refreshSessions() {
@@ -181,6 +190,7 @@
     activeSessionId = session.id;
     activePane = 'chat';
     await refreshSessions();
+    await scrollChatToBottom();
   }
 
   async function pickProjectAndCreate() {
@@ -194,6 +204,7 @@
     if (ok === undefined) return;
     activeSessionId = id;
     await refreshSessions();
+    await scrollChatToBottom();
   }
 
   async function openSession(id: string) {
@@ -381,7 +392,7 @@
             <div><p class="eyebrow">Active transcript</p><h1>{activeSession.name}</h1></div>
             <span class:streaming={activeSession.status === 'streaming'}>{activeSession.status}</span>
           </div>
-          <div class="chat-log">
+          <div class="chat-log" bind:this={chatLogEl}>
             {#each activeSession.messages as message, index}
               <article class="message {message.role}" style={`--i: ${index}`}>
                 <header><span>{message.role}</span><time>{formatTime(message.timestamp)}</time></header>
