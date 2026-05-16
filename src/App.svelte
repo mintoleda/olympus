@@ -152,7 +152,7 @@
     <header class="topbar">
       <div class="crumbs"><span>workspace</span><strong>{activeProjectName}</strong><em>{active.label}</em></div>
       <div class="topbar-actions">
-        <span class="pi-state">Pi: {activeSession?.status ?? 'offline'}</span>
+        <span class="pi-state" class:streaming={activeSession?.status === 'streaming'}>Pi: {activeSession?.status ?? 'offline'}</span>
         <button class="text-button" on:click={pickProjectAndCreate}>Open folder</button>
         <button class="solid-button" on:click={() => createSession()}>New session</button>
       </div>
@@ -190,7 +190,7 @@
         {#if activePane === 'chat' && activeSession}
           <div class="transcript-head">
             <div><p class="eyebrow">Active transcript</p><h1>{activeSession.name}</h1></div>
-            <span>{activeSession.status}</span>
+            <span class:streaming={activeSession.status === 'streaming'}>{activeSession.status}</span>
           </div>
           <div class="chat-log">
             {#each activeSession.messages as message, index}

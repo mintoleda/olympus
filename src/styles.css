@@ -69,6 +69,7 @@ input { color: var(--paper); outline: none; }
   min-height: 0;
   border-radius: var(--radius);
   padding: 12px;
+  animation: surface-in 260ms cubic-bezier(.2,.8,.2,1) both;
 }
 
 .product-mark {
@@ -111,6 +112,7 @@ input { color: var(--paper); outline: none; }
 }
 
 .pane-tabs button {
+  position: relative;
   display: grid;
   grid-template-columns: 32px 1fr;
   align-items: center;
@@ -136,8 +138,22 @@ input { color: var(--paper); outline: none; }
 }
 
 .pane-tabs button span { font-size: 0.82rem; }
+.pane-tabs button::before {
+  content: '';
+  position: absolute;
+  left: -13px;
+  top: 9px;
+  width: 3px;
+  height: 22px;
+  border-radius: 99px;
+  background: var(--accent);
+  opacity: 0;
+  transform: scaleY(0.35);
+  transition: opacity 160ms ease, transform 180ms cubic-bezier(.2,.8,.2,1);
+}
 .pane-tabs button:hover { color: var(--paper); background: rgba(255, 255, 255, 0.025); }
 .pane-tabs button.active { color: var(--paper); border-color: var(--line-strong); background: var(--base-3); }
+.pane-tabs button.active::before { opacity: 1; transform: scaleY(1); }
 .pane-tabs button.active b { color: var(--ink); border-color: var(--accent); background: var(--accent); }
 
 .rail-status {
@@ -172,6 +188,7 @@ input { color: var(--paper); outline: none; }
   min-width: 0;
   border-radius: var(--radius);
   padding: 0 12px 0 16px;
+  animation: surface-in 260ms 45ms cubic-bezier(.2,.8,.2,1) both;
 }
 
 .crumbs {
@@ -206,7 +223,10 @@ input { color: var(--paper); outline: none; }
 .pi-state {
   color: var(--muted);
   font-size: 0.76rem;
+  transition: color 160ms ease;
 }
+
+.pi-state.streaming { color: var(--accent); animation: live-tick 1.25s steps(2, end) infinite; }
 
 .text-button,
 .solid-button,
@@ -248,6 +268,7 @@ input { color: var(--paper); outline: none; }
   gap: 12px;
   min-height: 0;
   overflow: hidden;
+  transition: grid-template-columns 220ms cubic-bezier(.2,.8,.2,1);
 }
 
 .layout.chat-layout {
@@ -306,7 +327,10 @@ input { color: var(--paper); outline: none; }
   border: 1px solid var(--line);
   border-radius: 9px;
   background: #181815;
+  transition: transform 140ms ease, border-color 140ms ease, background 140ms ease;
 }
+
+.session-tree > button:hover { transform: translateX(3px); }
 
 .session-tree > button:hover,
 .session-tree > button.chosen {
@@ -335,6 +359,7 @@ input { color: var(--paper); outline: none; }
   height: 100%;
   padding: 18px 6px;
   color: var(--muted);
+  animation: rail-fold-in 190ms cubic-bezier(.2,.8,.2,1) both;
 }
 
 .sessions-peek span {
@@ -368,6 +393,7 @@ input { color: var(--paper); outline: none; }
   height: 100%;
   overflow: hidden;
   padding: 16px;
+  animation: surface-in 260ms 85ms cubic-bezier(.2,.8,.2,1) both;
 }
 
 .main-panel.home-panel { grid-template-rows: minmax(0, 1fr) auto; }
@@ -397,6 +423,11 @@ h1 {
   border-radius: 999px;
   padding: 5px 9px;
   font-size: 0.7rem;
+}
+
+.transcript-head span.streaming {
+  border-color: var(--accent);
+  animation: live-tick 1.25s steps(2, end) infinite;
 }
 
 .chat-log {
@@ -450,6 +481,9 @@ h1 {
 .launch-card h1 { max-width: 760px; font-size: clamp(2.35rem, 5.6vw, 6.4rem); }
 .launch-card p:not(.eyebrow) { max-width: 680px; margin: 18px 0 0; color: var(--muted); line-height: 1.7; }
 .home-actions { flex-wrap: wrap; margin-top: 32px; }
+.home-actions button { animation: ledger-in 240ms cubic-bezier(.2,.8,.2,1) both; }
+.home-actions button:nth-child(2) { animation-delay: 45ms; }
+.home-actions button:nth-child(3) { animation-delay: 90ms; }
 .home-actions button:disabled { cursor: not-allowed; opacity: 0.45; }
 
 .home-metrics {
@@ -467,7 +501,13 @@ h1 {
   border: 1px solid var(--line);
   border-radius: 10px;
   background: #181815;
+  animation: ledger-in 260ms cubic-bezier(.2,.8,.2,1) both;
 }
+
+.home-metrics article:nth-child(2),
+.meters article:nth-child(2) { animation-delay: 55ms; }
+.home-metrics article:nth-child(3),
+.meters article:nth-child(3) { animation-delay: 110ms; }
 
 .home-metrics span,
 .meters span { color: var(--muted); text-transform: uppercase; letter-spacing: 0.1em; font-size: 0.62rem; }
@@ -498,9 +538,12 @@ h1 {
   border: 1px solid var(--line);
   border-radius: 9px;
   background: var(--base-2);
+  animation: ledger-in 220ms cubic-bezier(.2,.8,.2,1) both;
+  transition: transform 140ms ease, border-color 140ms ease, background 140ms ease;
 }
 .recent-list button:hover,
 .recent-list button.current { border-color: var(--accent); background: #202318; }
+.recent-list button:hover { transform: translateX(3px); }
 .session-dot { grid-row: 1 / 3; width: 8px; height: 8px; border-radius: 50%; background: var(--accent); }
 .recent-list strong,
 .recent-list small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -525,8 +568,9 @@ h1 {
   border: 1px solid var(--line-strong);
   border-radius: 12px;
   background: #11110f;
+  transition: transform 150ms ease, border-color 150ms ease, background 150ms ease;
 }
-.command-dock:focus-within { border-color: var(--accent); }
+.command-dock:focus-within { border-color: var(--accent); background: #141610; transform: translateY(-2px); }
 .command-dock label { color: var(--muted); text-transform: uppercase; letter-spacing: 0.12em; font-size: 0.64rem; padding-left: 6px; }
 .command-dock input { min-width: 0; border: 0; background: transparent; }
 .command-dock button { color: var(--ink); border-color: var(--accent); background: var(--accent); font-weight: 700; }
@@ -540,7 +584,7 @@ h1 {
   overflow: hidden;
 }
 .runtime-panel,
-.context-card { padding: 14px; }
+.context-card { padding: 14px; animation: surface-in 260ms 120ms cubic-bezier(.2,.8,.2,1) both; }
 .meters { display: grid; gap: 8px; }
 .context-card { border-color: color-mix(in srgb, var(--accent) 30%, var(--line)); }
 .context-card h2 { margin: 10px 0; color: var(--paper); font-family: Georgia, Cambria, serif; font-size: 1.65rem; letter-spacing: -0.04em; }
@@ -549,6 +593,26 @@ h1 {
 :focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
+}
+
+@keyframes surface-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes ledger-in {
+  from { opacity: 0; transform: translateX(-6px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+
+@keyframes rail-fold-in {
+  from { opacity: 0; transform: scaleX(.82); transform-origin: left center; }
+  to { opacity: 1; transform: scaleX(1); transform-origin: left center; }
+}
+
+@keyframes live-tick {
+  0%, 100% { opacity: 1; }
+  50% { opacity: .58; }
 }
 
 @keyframes message-in {
