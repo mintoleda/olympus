@@ -1,8 +1,17 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
   import { open } from '@tauri-apps/plugin-dialog';
+  import {
+    animateLatestMessage,
+    animatePaneChange,
+    animateSessionRail,
+    animateShellEnter,
+    animateStreamingStatus,
+    createAppAnimationScope
+  } from './animations';
+  import type { Scope } from 'animejs';
 
   type PaneId = 'home' | 'chat' | 'widgets' | 'search' | 'settings';
   type ChatMessage = { id: string; role: 'user' | 'assistant' | 'status'; content: string; timestamp: number };
@@ -29,6 +38,13 @@
   let draft = '';
   let error = '';
   let sessionsCollapsed = false;
+  let rootEl: HTMLElement;
+  let animationScope: Scope | undefined;
+  let animationReady = false;
+  let lastAnimatedPane: PaneId = activePane;
+  let lastAnimatedCollapsed = sessionsCollapsed;
+  let lastAnimatedMessageCount = 0;
+  let lastAnimatedStatus = '';
   $: active = panes.find((pane) => pane.id === activePane) ?? panes[0];
   $: activeSession = sessions.find((session) => session.id === activeSessionId) ?? sessions[0];
   $: groupedSessions = Object.entries(
@@ -46,6 +62,23 @@
     { label: 'Project', value: activeProjectName, note: activeSession?.status ?? 'waiting' },
     { label: 'Events', value: String(sessions.reduce((count, session) => count + session.messages.length, 0)), note: 'local transcript entries' }
   ];
+  $: activeMessageCount = activeSession?.messages.length ?? 0;
+  $: if (animationReady && rootEl && activePane !== lastAnimatedPane) {
+    lastAnimatedPane = activePane;
+    tick().then(() => animatePaneChange(rootEl));
+  }
+  $: if (animationReady && rootEl && sessionsCollapsed !== lastAnimatedCollapsed) {
+    lastAnimatedCollapsed = sessionsCollapsed;
+    tick().then(() => animateSessionRail(rootEl, sessionsCollapsed));
+  }
+  $: if (animationReady && rootEl && activeMessageCount > lastAnimatedMessageCount) {
+    lastAnimatedMessageCount = activeMessageCount;
+    tick().then(() => animateLatestMessage(rootEl));
+  }
+  $: if (animationReady && rootEl && activeSession?.status && activeSession.status !== lastAnimatedStatus) {
+    lastAnimatedStatus = activeSession.status;
+    if (activeSession.status === 'streaming') tick().then(() => animateStreamingStatus(rootEl));
+  }
 
   function formatTime(timestamp: number) {
     if (!timestamp) return 'no activity';
@@ -98,6 +131,11 @@
 
   onMount(() => {
     let unlisten: (() => void) | undefined;
+    animationScope = createAppAnimationScope(rootEl);
+    animateShellEnter(rootEl, animationScope);
+    animationReady = true;
+    lastAnimatedMessageCount = activeMessageCount;
+    lastAnimatedStatus = activeSession?.status ?? '';
 
     listen<SessionEvent>('pi://message', (event) => {
       const { session_id, message } = event.payload;
@@ -131,11 +169,14 @@
       }
     })();
 
-    return () => unlisten?.();
+    return () => {
+      unlisten?.();
+      animationScope?.revert();
+    };
   });
 </script>
 
-<main class="ops-shell">
+<main class="ops-shell" bind:this={rootEl}>
   <aside class="nav-rail" aria-label="Primary navigation">
     <div class="product-mark"><span>OL</span><small>Olympus</small></div>
     <nav class="pane-tabs">
