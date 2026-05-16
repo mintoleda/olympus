@@ -256,6 +256,40 @@ fn provider_label(data: &Value) -> Option<String> {
     .or_else(|| value_string(data.pointer("/model/api")))
 }
 
+fn emit_updated_session(app: &AppHandle, session: Option<PiSession>) {
+    if let Some(session) = session {
+        emit_session_update(app, session);
+    }
+}
+
+fn handle_set_model_response(app: &AppHandle, session_id: &str, data: &Value) {
+    let provider = value_string(data.get("provider"));
+    let model = value_string(data.get("name")).or_else(|| value_string(data.get("id")));
+    let model_id = value_string(data.get("id")).or_else(|| value_string(data.get("name")));
+
+    let store = app.state::<SessionStore>();
+    let mut updated_session = None;
+    if let Ok(mut sessions) = store.sessions.lock() {
+        if let Some(session) = sessions.get_mut(session_id) {
+            if let Some(provider) = provider {
+                session.provider = Some(provider);
+            }
+            if let Some(model) = model {
+                session.model = Some(model);
+            }
+            if let Some(model_id) = model_id {
+                session.model_id = Some(model_id);
+            }
+            if session.status == "updating" || session.status == "starting" {
+                session.status = "idle".into();
+            }
+            updated_session = Some(session.clone());
+        }
+        let _ = save_sessions(app, &sessions);
+    }
+    emit_updated_session(app, updated_session);
+}
+
 fn handle_state_response(app: &AppHandle, session_id: &str, data: &Value) {
     let pi_session_id = value_string(data.get("sessionId").or_else(|| data.get("session_id")));
     let pi_session_file =
@@ -303,9 +337,7 @@ fn handle_state_response(app: &AppHandle, session_id: &str, data: &Value) {
         }
         let _ = save_sessions(app, &sessions);
     };
-    if let Some(session) = updated_session {
-        emit_session_update(app, session);
-    }
+    emit_updated_session(app, updated_session);
 }
 
 fn write_rpc(runtime: &RunningSession, request: Value) -> Result<(), String> {
@@ -322,6 +354,14 @@ fn request_pi_state(runtime: &RunningSession, session_id: &str) -> Result<(), St
 }
 
 fn spawn_pi(app: AppHandle, session_id: String) -> Result<RunningSession, String> {
+    spawn_pi_inner(app, session_id, true)
+}
+
+fn spawn_pi_inner(
+    app: AppHandle,
+    session_id: String,
+    request_initial_state: bool,
+) -> Result<RunningSession, String> {
     let store = app.state::<SessionStore>();
     if let Some(existing) = store
         .runtimes
@@ -330,7 +370,9 @@ fn spawn_pi(app: AppHandle, session_id: String) -> Result<RunningSession, String
         .get(&session_id)
         .cloned()
     {
-        request_pi_state(&existing, &session_id)?;
+        if request_initial_state {
+            request_pi_state(&existing, &session_id)?;
+        }
         return Ok(existing);
     }
 
@@ -395,6 +437,12 @@ fn spawn_pi(app: AppHandle, session_id: String) -> Result<RunningSession, String
                     if event.get("command").and_then(Value::as_str) == Some("get_state") {
                         if let Some(data) = event.get("data") {
                             handle_state_response(&reader_app, &reader_session_id, data);
+                        }
+                    } else if event.get("command").and_then(Value::as_str) == Some("set_model")
+                        && event.get("success").and_then(Value::as_bool) == Some(true)
+                    {
+                        if let Some(data) = event.get("data") {
+                            handle_set_model_response(&reader_app, &reader_session_id, data);
                         }
                     } else if event.get("success").and_then(Value::as_bool) == Some(false) {
                         let text = event
@@ -472,7 +520,9 @@ fn spawn_pi(app: AppHandle, session_id: String) -> Result<RunningSession, String
         });
     }
 
-    request_pi_state(&runtime, &session_id)?;
+    if request_initial_state {
+        request_pi_state(&runtime, &session_id)?;
+    }
 
     Ok(runtime)
 }
@@ -658,22 +708,36 @@ fn set_pi_model(
     model_id: String,
     app: AppHandle,
 ) -> Result<(), String> {
-    let runtime = spawn_pi(app, id.clone())?;
+    let runtime = spawn_pi_inner(app, id.clone(), false)?;
     write_rpc(
         &runtime,
         serde_json::json!({"id": format!("{id}-set-model-{}", now_ms()), "type": "set_model", "provider": provider, "modelId": model_id}),
     )?;
-    request_pi_state(&runtime, &id)
+    Ok(())
 }
 
 #[tauri::command]
 fn set_pi_thinking_level(id: String, level: String, app: AppHandle) -> Result<(), String> {
-    let runtime = spawn_pi(app, id.clone())?;
+    let runtime = spawn_pi_inner(app.clone(), id.clone(), false)?;
     write_rpc(
         &runtime,
         serde_json::json!({"id": format!("{id}-set-thinking-{}", now_ms()), "type": "set_thinking_level", "level": level}),
     )?;
-    request_pi_state(&runtime, &id)
+
+    let store = app.state::<SessionStore>();
+    let mut updated_session = None;
+    if let Ok(mut sessions) = store.sessions.lock() {
+        if let Some(session) = sessions.get_mut(&id) {
+            session.thinking_level = Some(level);
+            if session.status == "updating" || session.status == "starting" {
+                session.status = "idle".into();
+            }
+            updated_session = Some(session.clone());
+        }
+        let _ = save_sessions(&app, &sessions);
+    }
+    emit_updated_session(&app, updated_session);
+    Ok(())
 }
 
 #[tauri::command]
