@@ -21,21 +21,27 @@
 
   type PaneId = 'home' | 'chat' | 'widgets' | 'search' | 'settings';
   type ChatMessage = { id: string; role: 'user' | 'assistant' | 'status'; content: string; timestamp: number };
-  type PiSession = { id: string; name: string; project_path: string; status: string; messages: ChatMessage[]; pi_session_id?: string | null; pi_session_file?: string | null };
+  type PiSession = {
+    id: string;
+    name: string;
+    project_path: string;
+    status: string;
+    messages: ChatMessage[];
+    pi_session_id?: string | null;
+    pi_session_file?: string | null;
+    model?: string | null;
+    provider?: string | null;
+    thinking_level?: string | null;
+  };
   type SessionEvent = { session_id: string; message: ChatMessage };
+  type SessionUpdateEvent = { session: PiSession };
 
   const panes: Array<{ id: PaneId; label: string; key: string; description: string }> = [
     { id: 'home', label: 'Home', key: 'HM', description: 'Resume recent work, open a folder, or start a clean Pi context.' },
     { id: 'chat', label: 'Sessions', key: 'SE', description: 'Project-bound Pi conversations with local transcript history.' },
-    { id: 'widgets', label: 'Runtime', key: 'RT', description: 'Local tools, process telemetry, and trusted desktop modules.' },
+    { id: 'widgets', label: 'Pi', key: 'PI', description: 'Live Pi configuration, provider, model, thinking level, and resume identity.' },
     { id: 'search', label: 'Find', key: 'FD', description: 'A planned index for sessions, files, commands, and widgets.' },
     { id: 'settings', label: 'Settings', key: 'ST', description: 'Preferences, permissions, theme, layout, and platform details.' }
-  ];
-
-  const widgets = [
-    { label: 'CPU', value: '11%', note: 'quiet' },
-    { label: 'Memory', value: '2.8G', note: 'steady' },
-    { label: 'Pi', value: 'ready', note: 'headless' }
   ];
 
   let activePane: PaneId = 'home';
@@ -66,6 +72,17 @@
     .sort((a, b) => latestTimestamp(b) - latestTimestamp(a))
     .slice(0, 6);
   $: activeProjectName = activeSession?.project_path.split('/').filter(Boolean).at(-1) ?? 'workspace';
+  $: piRuntimeFacts = [
+    { label: 'Provider', value: activeSession?.provider ?? 'detecting', note: 'current Pi backend' },
+    { label: 'Model', value: activeSession?.model ?? 'waiting', note: 'selected model' },
+    { label: 'Thinking', value: activeSession?.thinking_level ?? 'default', note: 'reasoning level' }
+  ];
+  $: piWrapperDetails = [
+    ...piRuntimeFacts,
+    { label: 'Pi session', value: activeSession?.pi_session_id ?? 'not linked yet', note: 'resume identifier' },
+    { label: 'Session file', value: activeSession?.pi_session_file ?? 'managed by Pi', note: 'local transcript source' },
+    { label: 'Status', value: activeSession?.status ?? 'offline', note: activeSession ? 'RPC connection state' : 'create a session to start Pi' }
+  ];
   $: homeStats = [
     { label: 'Sessions', value: String(sessions.length).padStart(2, '0'), note: sessions.length === 1 ? 'context mounted' : 'contexts mounted' },
     { label: 'Project', value: activeProjectName, note: activeSession?.status ?? 'waiting' },
@@ -180,7 +197,7 @@
   }
 
   onMount(() => {
-    let unlisten: (() => void) | undefined;
+    let unlisteners: Array<() => void> = [];
     let disposed = false;
     const detachInteractions = attachInteractionAnimations(rootEl);
     animationScope = createAppAnimationScope(rootEl);
@@ -194,7 +211,7 @@
 
     (async () => {
       try {
-        const cleanup = await listen<SessionEvent>('pi://message', (event) => {
+        const messageCleanup = await listen<SessionEvent>('pi://message', (event) => {
           const { session_id, message } = event.payload;
           sessions = sessions.map((session) => {
             if (session.id !== session_id) return session;
@@ -214,11 +231,19 @@
             return { ...session, status: message.role === 'assistant' ? 'streaming' : session.status, messages: [...session.messages, message] };
           });
         });
+        const sessionCleanup = await listen<SessionUpdateEvent>('pi://session', (event) => {
+          const updated = event.payload.session;
+          sessions = sessions.some((session) => session.id === updated.id)
+            ? sessions.map((session) => (session.id === updated.id ? updated : session))
+            : [...sessions, updated];
+          if (!activeSessionId) activeSessionId = updated.id;
+        });
         if (disposed) {
-          cleanup();
+          messageCleanup();
+          sessionCleanup();
           return;
         }
-        unlisten = cleanup;
+        unlisteners = [messageCleanup, sessionCleanup];
         await refreshSessions();
         if (sessions.length === 0) await createSession();
       } catch (err) {
@@ -228,7 +253,7 @@
 
     return () => {
       disposed = true;
-      unlisten?.();
+      unlisteners.forEach((unlisten) => unlisten());
       detachInteractions();
       animationScope?.revert();
     };
@@ -286,7 +311,7 @@
         {/if}
       {/if}
 
-      <section class="main-panel panel" class:home-panel={activePane === 'home'}>
+      <section class="main-panel panel" class:home-panel={activePane === 'home'} class:info-panel={activePane !== 'chat'}>
         {#if activePane === 'chat' && activeSession}
           <div class="transcript-head">
             <div><p class="eyebrow">Active transcript</p><h1>{activeSession.name}</h1></div>
@@ -305,7 +330,7 @@
             <section class="launch-card">
               <p class="eyebrow">Local command center</p>
               <h1>Pick up the thread without opening another terminal.</h1>
-              <p>Mount a project folder, resume a Pi context, or start a clean session. Olympus keeps the transcript, runtime state, and session stack in one desktop surface.</p>
+              <p>Mount a project folder, resume a Pi context, or start a clean session. Olympus wraps Pi with transcript history, model/provider state, and session stack in one desktop surface.</p>
               <div class="home-actions" aria-label="Home quick actions">
                 <button class="primary-action" on:click={() => (activePane = 'chat')} disabled={!activeSession}>Resume active session</button>
                 <button on:click={pickProjectAndCreate}>Open project folder</button>
@@ -341,6 +366,28 @@
               {/if}
             </section>
           </div>
+        {:else if activePane === 'widgets'}
+          <div class="pi-wrapper-surface">
+            <section class="pi-hero">
+              <p class="eyebrow">Pi wrapper</p>
+              <h1>{activeSession?.model ?? 'Waiting for Pi state'}</h1>
+              <p>Olympus is a desktop skin over Pi: it tracks the active provider, selected model, thinking level, resume id, and live RPC status for the current project-bound session.</p>
+              <div class="pi-badges" aria-label="Current Pi configuration">
+                <span>{activeSession?.provider ?? 'provider pending'}</span>
+                <span>{activeSession?.thinking_level ?? 'default thinking'}</span>
+                <span>{activeSession?.status ?? 'offline'}</span>
+              </div>
+            </section>
+            <section class="pi-detail-grid" aria-label="Pi session details">
+              {#each piWrapperDetails as detail}
+                <article>
+                  <span>{detail.label}</span>
+                  <strong>{detail.value}</strong>
+                  <small>{detail.note}</small>
+                </article>
+              {/each}
+            </section>
+          </div>
         {:else}
           <div class="placeholder-copy">
             <p class="eyebrow">{active.key} / {active.label}</p>
@@ -359,10 +406,10 @@
 
       <aside class="inspector">
         <section class="panel runtime-panel">
-          <div class="panel-head"><span>Runtime</span><small>local</small></div>
+          <div class="panel-head"><span>Pi wrapper</span><small>{activeSession?.status ?? 'offline'}</small></div>
           <div class="meters">
-            {#each widgets as widget}
-              <article><span>{widget.label}</span><strong>{widget.value}</strong><small>{widget.note}</small></article>
+            {#each piRuntimeFacts as fact}
+              <article><span>{fact.label}</span><strong>{fact.value}</strong><small>{fact.note}</small></article>
             {/each}
           </div>
         </section>

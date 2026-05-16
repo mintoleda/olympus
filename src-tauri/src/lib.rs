@@ -43,6 +43,11 @@ struct SessionEvent {
     message: ChatMessage,
 }
 
+#[derive(Clone, Serialize)]
+struct SessionUpdateEvent {
+    session: PiSession,
+}
+
 #[derive(Clone)]
 struct RunningSession {
     child: Arc<Mutex<Child>>,
@@ -119,6 +124,10 @@ fn emit_message(app: &AppHandle, session_id: &str, message: ChatMessage) {
             message,
         },
     );
+}
+
+fn emit_session_update(app: &AppHandle, session: PiSession) {
+    let _ = app.emit("pi://session", SessionUpdateEvent { session });
 }
 
 fn mark_status(app: &AppHandle, session_id: &str, status: &str) {
@@ -199,6 +208,7 @@ fn handle_state_response(app: &AppHandle, session_id: &str, data: &Value) {
         .map(str::to_string);
 
     let store = app.state::<SessionStore>();
+    let mut updated_session = None;
     if let Ok(mut sessions) = store.sessions.lock() {
         if let Some(session) = sessions.get_mut(session_id) {
             if let Some(id) = pi_session_id {
@@ -222,9 +232,13 @@ fn handle_state_response(app: &AppHandle, session_id: &str, data: &Value) {
             if session.status == "starting" {
                 session.status = "idle".into();
             }
+            updated_session = Some(session.clone());
         }
         let _ = save_sessions(app, &sessions);
     };
+    if let Some(session) = updated_session {
+        emit_session_update(app, session);
+    }
 }
 
 fn spawn_pi(app: AppHandle, session_id: String) -> Result<RunningSession, String> {
