@@ -40,6 +40,14 @@
   type ConfigChooser = 'provider' | 'model' | 'thinking' | null;
 
   const thinkingLevels = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh'];
+  const thinkingSubtitles: Record<string, string> = {
+    off: 'fastest responses',
+    minimal: 'quick code edits',
+    low: 'light planning',
+    medium: 'balanced analysis',
+    high: 'deep problem solving',
+    xhigh: 'maximum deliberation'
+  };
 
   const panes: Array<{ id: PaneId; label: string; key: string; description: string }> = [
     { id: 'home', label: 'Home', key: 'HM', description: 'Resume recent work, open a folder, or start a clean Pi context.' },
@@ -449,7 +457,7 @@
                 {#each thinkingLevels as level}
                   <button class:chosen={level === activeSession?.thinking_level} on:click={() => selectThinking(level)}>
                     <strong>{level}</strong>
-                    <small>{level === 'off' ? 'no reasoning budget' : 'reasoning depth'}</small>
+                    <small>{thinkingSubtitles[level]}</small>
                   </button>
                 {/each}
               </div>
