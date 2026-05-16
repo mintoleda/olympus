@@ -98,8 +98,8 @@
   }));
   $: activeProviderModels = modelOptions.filter((model) => model.provider === activeSession?.provider);
   $: modelSearch = modelFilter.trim().toLowerCase();
-  $: filteredModels = modelOptions
-    .filter((model) => !modelSearch || `${model.provider}/${model.id}`.toLowerCase().includes(modelSearch))
+  $: filteredModels = activeProviderModels
+    .filter((model) => !modelSearch || model.id.toLowerCase().includes(modelSearch))
     .slice(0, 160);
   $: homeStats = [
     { label: 'Sessions', value: String(sessions.length).padStart(2, '0'), note: sessions.length === 1 ? 'context mounted' : 'contexts mounted' },
@@ -465,9 +465,11 @@
                 {/each}
               </div>
             {:else}
-              <input class="model-search" bind:value={modelFilter} placeholder="Filter models by provider or id…" />
+              <input class="model-search" bind:value={modelFilter} placeholder={`Filter ${activeSession?.provider ?? 'current provider'} models…`} />
               {#if activeProviderModels.length && !modelFilter}
-                <p class="chooser-hint">Showing all models. Current provider has {activeProviderModels.length} options.</p>
+                <p class="chooser-hint">Showing {activeProviderModels.length} models for {activeSession?.provider}.</p>
+              {:else if !activeProviderModels.length}
+                <p class="chooser-hint">No models found for the current provider yet.</p>
               {/if}
               <div class="choice-grid models">
                 {#each filteredModels as model}
