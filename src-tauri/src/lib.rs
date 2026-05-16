@@ -93,12 +93,19 @@ fn load_sessions(app: &AppHandle, store: &SessionStore) {
     let Ok(path) = sessions_path(app) else { return };
     let Ok(json) = fs::read_to_string(path) else { return };
     let Ok(sessions) = serde_json::from_str::<Vec<PiSession>>(&json) else { return };
+    let mut max_suffix: u64 = 0;
     if let Ok(mut map) = store.sessions.lock() {
         for mut session in sessions {
+            if let Some(suffix) = session.id.strip_prefix("session-").and_then(|s| s.parse::<u64>().ok()) {
+                if suffix > max_suffix {
+                    max_suffix = suffix;
+                }
+            }
             session.status = "idle".into();
             map.insert(session.id.clone(), session);
         }
     }
+    store.counter.store(max_suffix, Ordering::Relaxed);
 }
 
 fn emit_message(app: &AppHandle, session_id: &str, message: ChatMessage) {
@@ -199,15 +206,16 @@ fn handle_state_response(app: &AppHandle, session_id: &str, data: &Value) {
     };
 }
 
-fn spawn_pi(app: AppHandle, session_id: String) -> Result<(), String> {
+fn spawn_pi(app: AppHandle, session_id: String) -> Result<RunningSession, String> {
     let store = app.state::<SessionStore>();
-    if store
+    if let Some(existing) = store
         .runtimes
         .lock()
         .map_err(|_| "runtime store poisoned")?
-        .contains_key(&session_id)
+        .get(&session_id)
+        .cloned()
     {
-        return Ok(());
+        return Ok(existing);
     }
 
     let (project_path, resume_target) = {
@@ -332,7 +340,7 @@ fn spawn_pi(app: AppHandle, session_id: String) -> Result<(), String> {
         stdin.flush().map_err(|err| err.to_string())?;
     }
 
-    Ok(())
+    Ok(runtime)
 }
 
 #[tauri::command]
@@ -370,6 +378,10 @@ fn create_session(project_path: Option<String>, app: AppHandle, store: State<'_,
     Ok(session)
 }
 
+fn spawn_pi_unit(app: AppHandle, session_id: String) -> Result<(), String> {
+    spawn_pi(app, session_id).map(|_| ())
+}
+
 #[tauri::command]
 fn list_sessions(app: AppHandle, store: State<'_, SessionStore>) -> Result<Vec<PiSession>, String> {
     if store.sessions.lock().map_err(|_| "session store poisoned")?.is_empty() {
@@ -393,7 +405,7 @@ fn switch_session(id: String, app: AppHandle, store: State<'_, SessionStore>) ->
         return Err("session not found".into());
     }
     *store.active.lock().map_err(|_| "active session lock poisoned")? = Some(id.clone());
-    spawn_pi(app, id)
+    spawn_pi_unit(app, id)
 }
 
 #[tauri::command]
@@ -419,10 +431,6 @@ fn close_session(id: String, app: AppHandle, store: State<'_, SessionStore>) -> 
 
 #[tauri::command]
 fn send_message(id: String, content: String, app: AppHandle, store: State<'_, SessionStore>) -> Result<(), String> {
-    if !store.runtimes.lock().map_err(|_| "runtime store poisoned")?.contains_key(&id) {
-        spawn_pi(app.clone(), id.clone())?;
-    }
-
     let user_message = ChatMessage {
         id: format!("{id}-u-{}", now_ms()),
         role: "user".into(),
@@ -442,19 +450,27 @@ fn send_message(id: String, content: String, app: AppHandle, store: State<'_, Se
     }
     emit_message(&app, &id, user_message);
 
-    let runtime = store
-        .runtimes
-        .lock()
-        .map_err(|_| "runtime store poisoned")?
-        .get(&id)
-        .cloned()
-        .ok_or("session process not running")?;
+    let runtime = spawn_pi(app, id.clone())?;
 
     let mut stdin = runtime.stdin.lock().map_err(|_| "Pi stdin lock poisoned")?;
     let request = serde_json::json!({"id": format!("{id}-prompt-{}", now_ms()), "type": "prompt", "message": content});
     writeln!(stdin, "{request}").map_err(|err| err.to_string())?;
     stdin.flush().map_err(|err| err.to_string())?;
     Ok(())
+}
+
+fn shutdown_all_runtimes(app: &AppHandle) {
+    let store = app.state::<SessionStore>();
+    let runtimes: Vec<RunningSession> = match store.runtimes.lock() {
+        Ok(mut map) => map.drain().map(|(_, runtime)| runtime).collect(),
+        Err(_) => return,
+    };
+    for runtime in runtimes {
+        if let Ok(mut child) = runtime.child.lock() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -470,6 +486,11 @@ pub fn run() {
             load_sessions(&handle, &store);
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running olympus");
+        .build(tauri::generate_context!())
+        .expect("error while building olympus")
+        .run(|app_handle, event| {
+            if let tauri::RunEvent::Exit = event {
+                shutdown_all_runtimes(app_handle);
+            }
+        });
 }
