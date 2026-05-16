@@ -36,6 +36,15 @@
       return groups;
     }, {})
   );
+  $: recentSessions = [...sessions]
+    .sort((a, b) => Math.max(...b.messages.map((message) => message.timestamp), 0) - Math.max(...a.messages.map((message) => message.timestamp), 0))
+    .slice(0, 4);
+  $: activeProjectName = activeSession?.project_path.split('/').filter(Boolean).at(-1) ?? 'workspace';
+  $: homeStats = [
+    { label: 'Live sessions', value: String(sessions.length).padStart(2, '0'), note: sessions.length === 1 ? 'one context mounted' : 'contexts mounted' },
+    { label: 'Active project', value: activeProjectName, note: activeSession?.status ?? 'waiting' },
+    { label: 'Message trail', value: String(sessions.reduce((count, session) => count + session.messages.length, 0)), note: 'local conversation events' }
+  ];
 
   async function refreshSessions() {
     sessions = await invoke<PiSession[]>('list_sessions');
@@ -64,6 +73,11 @@
     await refreshSessions();
   }
 
+  async function openSession(id: string) {
+    await switchSession(id);
+    activePane = 'chat';
+  }
+
   async function closeSession(id: string) {
     await invoke('close_session', { id });
     await refreshSessions();
@@ -71,6 +85,7 @@
 
   async function send() {
     if (!activeSession || !draft.trim()) return;
+    activePane = 'chat';
     await invoke('send_message', { id: activeSession.id, content: draft });
     draft = '';
   }
@@ -125,29 +140,73 @@
       <button class="ghost-button" on:click={pickProjectAndCreate}>＋ New session</button>
     </header>
 
-    <div class="layout">
-      <aside class="project-tabs panel">
-        <div class="panel-head"><span>Projects</span><button on:click={pickProjectAndCreate}>＋</button></div>
-        {#each groupedSessions as [project, projectSessions]}
-          <p class="project-label">{project}</p>
-          {#each projectSessions as session}
-            <button class:chosen={session.id === activeSession?.id} on:click={() => switchSession(session.id)}>
-              <strong>{session.name}</strong><small>{session.project_path}</small><em>{session.status}</em>
-              <span class="close" role="button" tabindex="0" on:click|stopPropagation={() => closeSession(session.id)} on:keydown|stopPropagation={(event) => (event.key === 'Enter' || event.key === ' ') && closeSession(session.id)}>×</span>
-            </button>
+    <div class="layout" class:chat-layout={activePane === 'chat'}>
+      {#if activePane === 'chat'}
+        <aside class="project-tabs panel pane-pop">
+          <div class="panel-head"><span>Projects</span><button on:click={pickProjectAndCreate}>＋</button></div>
+          {#each groupedSessions as [project, projectSessions]}
+            <p class="project-label">{project}</p>
+            {#each projectSessions as session}
+              <button class:chosen={session.id === activeSession?.id} on:click={() => switchSession(session.id)}>
+                <strong>{session.name}</strong><small>{session.project_path}</small><em>{session.status}</em>
+                <span class="close" role="button" tabindex="0" on:click|stopPropagation={() => closeSession(session.id)} on:keydown|stopPropagation={(event) => (event.key === 'Enter' || event.key === ' ') && closeSession(session.id)}>×</span>
+              </button>
+            {/each}
           {/each}
-        {/each}
-      </aside>
+        </aside>
+      {/if}
 
-      <section class="hero panel chat-hero">
+      <section class="hero panel chat-hero" class:home-hero={activePane === 'home'} class:panel-shift={activePane !== 'chat'}>
         {#if activePane === 'chat' && activeSession}
           <div class="chat-log">
-            {#each activeSession.messages as message}
-              <article class="message {message.role}"><span>{message.role}</span><p>{message.content}</p></article>
+            {#each activeSession.messages as message, index}
+              <article class="message {message.role}" style={`--i: ${index}`}><span>{message.role}</span><p>{message.content}</p></article>
             {/each}
           </div>
+        {:else if activePane === 'home'}
+          <div class="home-surface">
+            <div class="orbital-mark" aria-hidden="true"><span></span><span></span><span></span></div>
+            <section class="welcome-block">
+              <p class="kicker">01 / Atrium</p>
+              <h2>Launch Pi without breaking orbit.</h2>
+              <p>Olympus opens on a quiet command deck: resume a project, create a fresh context, or send a prompt and land directly in chat.</p>
+              <div class="home-actions" aria-label="Home quick actions">
+                <button class="primary-action" on:click={() => (activePane = 'chat')} disabled={!activeSession}>Continue {activeSession?.name ?? 'session'} ↗</button>
+                <button on:click={() => createSession()}>New local session</button>
+                <button on:click={pickProjectAndCreate}>Open project folder</button>
+              </div>
+            </section>
+
+            <section class="home-grid" aria-label="Workspace overview">
+              {#each homeStats as stat}
+                <article class="home-stat">
+                  <span>{stat.label}</span>
+                  <strong>{stat.value}</strong>
+                  <small>{stat.note}</small>
+                </article>
+              {/each}
+            </section>
+
+            <section class="recent-card">
+              <div class="panel-head"><span>Recent flight paths</span><small>{recentSessions.length} ready</small></div>
+              {#if recentSessions.length}
+                <div class="recent-list">
+                  {#each recentSessions as session}
+                    <button class:current={session.id === activeSession?.id} on:click={() => openSession(session.id)}>
+                      <span class="session-orb"></span>
+                      <strong>{session.name}</strong>
+                      <small>{session.project_path}</small>
+                      <em>{session.status}</em>
+                    </button>
+                  {/each}
+                </div>
+              {:else}
+                <p class="empty-note">No sessions yet. Start one and it will appear here.</p>
+              {/if}
+            </section>
+          </div>
         {:else}
-          <div class="hero-copy"><p class="kicker">{active.key} / {active.label}</p><h2>{active.description}</h2><p>Phase 2 adds a real Rust session manager behind this shell. Create, switch, close, and stream independent Pi conversations without leaving the hub.</p></div>
+          <div class="hero-copy hero-enter"><p class="kicker">{active.key} / {active.label}</p><h2>{active.description}</h2><p>Phase 2 adds a real Rust session manager behind this shell. Create, switch, close, and stream independent Pi conversations without leaving the hub.</p></div>
         {/if}
 
         <div class="command-dock">
