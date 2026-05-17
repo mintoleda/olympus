@@ -1,7 +1,5 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte';
-  import { invoke } from '@tauri-apps/api/core';
-  import { listen } from '@tauri-apps/api/event';
   import { open } from '@tauri-apps/plugin-dialog';
   import {
     animateChatHistory,
@@ -15,57 +13,33 @@
     createAppAnimationScope
   } from './animations';
   import type { Scope } from 'animejs';
-
-  type PaneId = 'home' | 'chat' | 'search' | 'settings';
-  type ChatMessage = { id: string; role: 'user' | 'assistant' | 'status' | 'system'; content: string; timestamp: number; type?: string };
-  type PiSession = {
-    id: string;
-    name: string;
-    project_path: string;
-    status: string;
-    messages: ChatMessage[];
-    pi_session_id?: string | null;
-    pi_session_file?: string | null;
-    model?: string | null;
-    model_id?: string | null;
-    provider?: string | null;
-    thinking_level?: string | null;
-  };
-  type PiSessionMeta = {
-    session_id: string;
-    session_file: string;
-    project_path: string;
-    started_at: string;
-    last_activity_ms: number;
-    message_count: number;
-    preview: string;
-    provider?: string | null;
-    model_id?: string | null;
-    thinking_level?: string | null;
-  };
-  type SessionEvent = { session_id: string; message: ChatMessage };
-  type SessionUpdateEvent = { session: PiSession };
-  type PiModelOption = { provider: string; id: string; context: string; max_output: string; reasoning: boolean; images: boolean };
-  type PiCommandOption = { name: string; description: string; source: string; location?: string; path?: string };
-  type ExtensionUiRequest = { session_id: string; request: Record<string, any> };
-  type StatusEntry = { key: string; text: string };
-  type StatusEvent = { session_id: string; statuses: StatusEntry[] };
-  type WidgetEntry = { key: string; lines: string[]; placement: string };
-  type WidgetEvent = { session_id: string; widgets: WidgetEntry[] };
-  type NotifyEvent = { session_id: string; message: string; level: string };
-  type EditorTextEvent = { session_id: string; text: string };
-  type PrimaryPreset = 'plan' | 'build' | 'ask' | 'off';
-  const PRIMARY_CYCLE: PrimaryPreset[] = ['plan', 'build', 'ask', 'off'];
-  type ConfigChooser = 'provider' | 'model' | 'thinking' | null;
-
-  const thinkingLevels = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh'];
-
-  const panes: Array<{ id: PaneId; label: string; key: string; description: string }> = [
-    { id: 'home', label: 'Home', key: 'HM', description: 'Resume recent work, open a folder, or start a clean Pi context.' },
-    { id: 'chat', label: 'Chat', key: 'CH', description: 'Project-bound Pi conversations with model/provider controls.' },
-    { id: 'search', label: 'Find', key: 'FD', description: 'A planned index for sessions, files, commands, and Pi context.' },
-    { id: 'settings', label: 'Settings', key: 'ST', description: 'Preferences, permissions, theme, layout, and platform details.' }
-  ];
+  import ExtensionRequestDialog from './lib/components/ExtensionRequestDialog.svelte';
+  import { attachPiEventListeners } from './lib/services/piEvents';
+  import { piClient } from './lib/services/piClient';
+  import {
+    PRIMARY_CYCLE,
+    panes,
+    thinkingLevels,
+    type ConfigChooser,
+    type ExtensionUiRequest,
+    type PaneId,
+    type PiCommandOption,
+    type PiModelOption,
+    type PiSession,
+    type PiSessionMeta,
+    type StatusEntry,
+    type WidgetEntry
+  } from './lib/types/pi';
+  import {
+    formatTime,
+    latestTimestamp,
+    nextPreset,
+    parsePreset,
+    piImportPreview,
+    rankCommands,
+    relativeTime,
+    stripAnsi
+  } from './lib/utils/pi';
 
   let activePane: PaneId = 'home';
   let sessions: PiSession[] = [];
@@ -200,45 +174,12 @@
     if (['streaming','waiting','resetting'].includes(activeSession.status)) tick().then(() => animateStreamingStatus(rootEl));
   }
 
-  const timeFormatter = new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit' });
-
-  function stripAnsi(text: string): string {
-    return text ? text.replace(/\[[0-9;]*[A-Za-z]/g, '') : '';
-  }
-
-  function parsePreset(text: string | undefined): PrimaryPreset | undefined {
-    if (!text) return undefined;
-    const cleaned = stripAnsi(text).trim().toLowerCase();
-    const match = cleaned.match(/primary\s*[:=]\s*(plan|build|ask|off)/);
-    if (match) return match[1] as PrimaryPreset;
-    if (['plan', 'build', 'ask', 'off'].includes(cleaned)) return cleaned as PrimaryPreset;
-    return undefined;
-  }
-
-  function nextPreset(current: PrimaryPreset | undefined, direction: 1 | -1): PrimaryPreset {
-    const idx = current ? PRIMARY_CYCLE.indexOf(current) : -1;
-    const len = PRIMARY_CYCLE.length;
-    const nextIdx = direction === 1
-      ? (idx + 1 + len) % len
-      : (idx <= 0 ? len - 1 : idx - 1);
-    return PRIMARY_CYCLE[nextIdx];
-  }
 
   async function cyclePrimary(direction: 1 | -1 = 1) {
     if (!activeSession) return;
-    const target = nextPreset(activePreset, direction);
-    await runAction(() => invoke('send_pi_command', { id: activeSession!.id, content: `/primary ${target}` }));
+    const target = nextPreset(activePreset, PRIMARY_CYCLE, direction);
+    await runAction(() => piClient.sendPiCommand(activeSession!.id, `/primary ${target}`));
   }
-
-  function formatTime(timestamp: number) {
-    if (!timestamp) return 'no activity';
-    return timeFormatter.format(new Date(timestamp));
-  }
-
-  function latestTimestamp(session: PiSession): number {
-    return session.messages.reduce((max, message) => Math.max(max, message.timestamp), 0);
-  }
-
 
 
   async function scrollChatToBottom() {
@@ -247,7 +188,7 @@
   }
 
   async function refreshSessions() {
-    sessions = await invoke<PiSession[]>('list_sessions');
+    sessions = await piClient.listSessions();
     const stillExists = sessions.some((session) => session.id === activeSessionId);
     if (!stillExists) {
       activeSessionId = sessions.find((session) => session.status === 'active')?.id ?? sessions[0]?.id ?? '';
@@ -256,7 +197,7 @@
 
   async function refreshPiImports() {
     try {
-      pendingPiImports = await invoke<PiSessionMeta[]>('list_pi_imports', { projectPath: null });
+      pendingPiImports = await piClient.listPiImports();
     } catch (err) {
       pendingPiImports = [];
       error = String(err);
@@ -268,7 +209,7 @@
   async function importPiSession(meta: PiSessionMeta) {
     if (piImportBusy) return;
     piImportBusy = meta.session_file;
-    const session = await runAction(() => invoke<PiSession>('import_pi_session', { sessionFile: meta.session_file }));
+    const session = await runAction(() => piClient.importPiSession(meta.session_file));
     piImportBusy = '';
     if (!session) return;
     sessions = [...sessions.filter((item) => item.id !== session.id), session];
@@ -279,28 +220,6 @@
     await scrollChatToBottom();
   }
 
-  function piImportPreview(meta: PiSessionMeta): string {
-    const trimmed = meta.preview.trim();
-    if (trimmed) return trimmed;
-    return `${meta.message_count} message${meta.message_count === 1 ? '' : 's'}`;
-  }
-
-  function relativeTime(ms: number): string {
-    if (!ms) return '';
-    const diff = Date.now() - ms;
-    if (diff < 0) return 'just now';
-    const sec = Math.floor(diff / 1000);
-    if (sec < 60) return `${sec}s ago`;
-    const min = Math.floor(sec / 60);
-    if (min < 60) return `${min}m ago`;
-    const hr = Math.floor(min / 60);
-    if (hr < 24) return `${hr}h ago`;
-    const day = Math.floor(hr / 24);
-    if (day < 30) return `${day}d ago`;
-    const mo = Math.floor(day / 30);
-    if (mo < 12) return `${mo}mo ago`;
-    return `${Math.floor(mo / 12)}y ago`;
-  }
 
   async function runAction<T>(fn: () => Promise<T>): Promise<T | undefined> {
     try {
@@ -314,7 +233,7 @@
   }
 
   async function createSession(path?: string) {
-    const session = await runAction(() => invoke<PiSession>('create_session', { projectPath: path || null }));
+    const session = await runAction(() => piClient.createSession(path || null));
     if (!session) return;
     sessions = [...sessions.filter((item) => item.id !== session.id), session];
     activeSessionId = session.id;
@@ -331,7 +250,7 @@
   }
 
   async function switchSession(id: string) {
-    const ok = await runAction(() => invoke('switch_session', { id }));
+    const ok = await runAction(() => piClient.switchSession(id));
     if (ok === undefined) return;
     activeSessionId = id;
     await refreshSessions();
@@ -344,7 +263,7 @@
   }
 
   async function closeSession(id: string) {
-    const ok = await runAction(() => invoke('close_session', { id }));
+    const ok = await runAction(() => piClient.closeSession(id));
     if (ok === undefined) return;
     await refreshSessions();
     await refreshPiImports();
@@ -358,7 +277,7 @@
       draft = '';
       return;
     }
-    const ok = await runAction(() => invoke('send_message', { id: activeSession!.id, content: draft }));
+    const ok = await runAction(() => piClient.sendMessage(activeSession!.id, draft));
     if (ok !== undefined) draft = '';
   }
 
@@ -438,16 +357,16 @@
         await createSession();
         return true;
       case 'clear':
-        if (activeSession) await runAction(() => invoke('reset_pi_session', { id: activeSession!.id }));
+        if (activeSession) await runAction(() => piClient.resetPiSession(activeSession!.id));
         return true;
       case 'fork':
         await createSession(activeSession?.project_path);
         return true;
       case 'compact':
-        await runAction(() => invoke('compact_session', { id: activeSession!.id, customInstructions: args || null }));
+        await runAction(() => piClient.compactSession(activeSession!.id, args || null));
         return true;
       case 'name':
-        if (args) await runAction(() => invoke('rename_pi_session', { id: activeSession!.id, name: args }));
+        if (args) await runAction(() => piClient.renamePiSession(activeSession!.id, args));
         return true;
       case 'session':
         sessions = sessions.map((session) => session.id === activeSession!.id ? {
@@ -461,7 +380,7 @@
         } : session);
         return true;
       case 'stop':
-        if (activeSession) await runAction(() => invoke('stop_session', { id: activeSession!.id }));
+        if (activeSession) await runAction(() => piClient.stopSession(activeSession!.id));
         return true;
       case 'resume':
       case 'tree':
@@ -475,35 +394,6 @@
     }
   }
 
-  function fuzzyScore(name: string, query: string): number {
-    if (!query) return 1;
-    const lower = name.toLowerCase();
-    if (lower === query) return 1000;
-    if (lower.startsWith(query)) return 500 - (lower.length - query.length);
-    let qi = 0;
-    let score = 0;
-    let prevMatch = -2;
-    for (let i = 0; i < lower.length && qi < query.length; i++) {
-      if (lower[i] === query[qi]) {
-        score += 10;
-        if (i === prevMatch + 1) score += 8;
-        if (i === 0 || /[^a-z0-9]/.test(lower[i - 1])) score += 5;
-        prevMatch = i;
-        qi++;
-      }
-    }
-    if (qi < query.length) return -1;
-    return score - (lower.length - query.length);
-  }
-
-  function rankCommands(commands: PiCommandOption[], query: string): PiCommandOption[] {
-    if (!query) return [...commands].sort((a, b) => a.name.localeCompare(b.name));
-    const scored = commands
-      .map((command) => ({ command, score: fuzzyScore(command.name, query) }))
-      .filter((entry) => entry.score >= 0)
-      .sort((a, b) => b.score - a.score || a.command.name.localeCompare(b.command.name));
-    return scored.map((entry) => entry.command);
-  }
 
   async function loadCommandOptions(sessionId: string, force = false) {
     if (!sessionId) return;
@@ -517,7 +407,7 @@
     if (commandFetchInFlight === sessionId) return;
     commandFetchInFlight = sessionId;
     try {
-      const commands = await runAction(() => invoke<PiCommandOption[]>('list_pi_commands', { id: sessionId }));
+      const commands = await runAction(() => piClient.listPiCommands(sessionId));
       if (commands) {
         commandCache.set(sessionId, commands);
         if (activeSession?.id === sessionId) commandOptions = commands;
@@ -543,18 +433,16 @@
 
   async function respondToExtensionRequest(response: Record<string, any>) {
     if (!extensionRequest) return;
-    await runAction(() => invoke('respond_extension_ui', {
-      id: extensionRequest!.session_id,
-      requestId: extensionRequest!.request.id,
-      response
-    }));
+    await runAction(() =>
+      piClient.respondExtensionUi(extensionRequest!.session_id, extensionRequest!.request.id, response)
+    );
     extensionRequest = null;
   }
 
   async function ensureModelOptions() {
     if (!activeSession || modelLoading || modelOptions.length) return;
     modelLoading = true;
-    const models = await runAction(() => invoke<PiModelOption[]>('list_pi_models', { id: activeSession!.id }));
+    const models = await runAction(() => piClient.listPiModels(activeSession!.id));
     if (models) modelOptions = models;
     modelLoading = false;
   }
@@ -568,28 +456,54 @@
   async function selectProvider(provider: string) {
     if (!activeSession) return;
     const preferredId = activeSession.model_id ?? activeSession.model?.toLowerCase();
-    const model = modelOptions.find((item) => item.provider === provider && item.id === preferredId) ?? modelOptions.find((item) => item.provider === provider);
+    const model =
+      modelOptions.find((item) => item.provider === provider && item.id === preferredId) ??
+      modelOptions.find((item) => item.provider === provider);
     if (!model) return;
     activeChooser = null;
-    const ok = await runAction(() => invoke('set_pi_model', { id: activeSession!.id, provider: model.provider, modelId: model.id }));
+    const ok = await runAction(() =>
+      piClient.setPiModel(activeSession!.id, model.provider, model.id)
+    );
     if (ok !== undefined) {
-      sessions = sessions.map((session) => session.id === activeSession!.id ? { ...session, provider: model.provider, model: model.id, model_id: model.id, status: 'updating' } : session);
+      sessions = sessions.map((session) =>
+        session.id === activeSession!.id
+          ? {
+              ...session,
+              provider: model.provider,
+              model: model.id,
+              model_id: model.id,
+              status: 'updating'
+            }
+          : session
+      );
     }
   }
 
   async function selectModel(model: PiModelOption) {
     if (!activeSession) return;
     activeChooser = null;
-    const ok = await runAction(() => invoke('set_pi_model', { id: activeSession!.id, provider: model.provider, modelId: model.id }));
+    const ok = await runAction(() =>
+      piClient.setPiModel(activeSession!.id, model.provider, model.id)
+    );
     if (ok !== undefined) {
-      sessions = sessions.map((session) => session.id === activeSession!.id ? { ...session, provider: model.provider, model: model.id, model_id: model.id, status: 'updating' } : session);
+      sessions = sessions.map((session) =>
+        session.id === activeSession!.id
+          ? {
+              ...session,
+              provider: model.provider,
+              model: model.id,
+              model_id: model.id,
+              status: 'updating'
+            }
+          : session
+      );
     }
   }
 
   async function selectThinking(level: string) {
     if (!activeSession) return;
     activeChooser = null;
-    const ok = await runAction(() => invoke('set_pi_thinking_level', { id: activeSession!.id, level }));
+    const ok = await runAction(() => piClient.setPiThinkingLevel(activeSession!.id, level));
     if (ok !== undefined) {
       sessions = sessions.map((session) => session.id === activeSession!.id ? { ...session, thinking_level: level, status: 'updating' } : session);
     }
@@ -613,74 +527,79 @@
 
     (async () => {
       try {
-        const messageCleanup = await listen<SessionEvent>('pi://message', (event) => {
-          const { session_id, message } = event.payload;
-          sessions = sessions.map((session) => {
-            if (session.id !== session_id) return session;
-            if (message.role === 'status') return { ...session, status: message.content || 'idle' };
-            if (message.role === 'assistant') {
-              const existing = session.messages.find((item) => item.id === message.id);
-              if (existing) {
-                return {
-                  ...session,
-                  status: 'streaming',
-                  messages: session.messages.map((item) =>
-                    item.id === message.id ? { ...item, content: item.content + message.content } : item
-                  )
-                };
+        const listeners = await attachPiEventListeners({
+          onMessage: ({ session_id, message }) => {
+            sessions = sessions.map((session) => {
+              if (session.id !== session_id) return session;
+              if (message.role === 'status') return { ...session, status: message.content || 'idle' };
+              if (message.role === 'assistant') {
+                const existing = session.messages.find((item) => item.id === message.id);
+                if (existing) {
+                  return {
+                    ...session,
+                    status: 'streaming',
+                    messages: session.messages.map((item) =>
+                      item.id === message.id ? { ...item, content: item.content + message.content } : item
+                    )
+                  };
+                }
               }
+              return {
+                ...session,
+                status: message.role === 'assistant' ? 'streaming' : session.status,
+                messages: [...session.messages, message]
+              };
+            });
+          },
+          onSessionUpdate: ({ session: updated }) => {
+            sessions = sessions.some((session) => session.id === updated.id)
+              ? sessions.map((session) => (session.id === updated.id ? updated : session))
+              : [...sessions, updated];
+            if (!activeSessionId) activeSessionId = updated.id;
+          },
+          onExtensionRequest: (payload) => {
+            extensionRequest = payload;
+          },
+          onStatus: ({ session_id, statuses }) => {
+            const next = new Map(sessionStatuses);
+            next.set(session_id, statuses);
+            sessionStatuses = next;
+          },
+          onWidget: ({ session_id, widgets }) => {
+            const next = new Map(sessionWidgets);
+            next.set(session_id, widgets);
+            sessionWidgets = next;
+          },
+          onNotify: ({ session_id, message, level }) => {
+            sessions = sessions.map((session) =>
+              session.id === session_id
+                ? {
+                    ...session,
+                    messages: [
+                      ...session.messages,
+                      {
+                        id: `${session_id}-notify-${Date.now()}`,
+                        role: 'status',
+                        content: `${level}: ${stripAnsi(message)}`,
+                        timestamp: Date.now()
+                      }
+                    ]
+                  }
+                : session
+            );
+          },
+          onEditorText: ({ session_id, text }) => {
+            if (activeSession && session_id === activeSession.id) {
+              draft = text;
             }
-            return { ...session, status: message.role === 'assistant' ? 'streaming' : session.status, messages: [...session.messages, message] };
-          });
-        });
-        const sessionCleanup = await listen<SessionUpdateEvent>('pi://session', (event) => {
-          const updated = event.payload.session;
-          sessions = sessions.some((session) => session.id === updated.id)
-            ? sessions.map((session) => (session.id === updated.id ? updated : session))
-            : [...sessions, updated];
-          if (!activeSessionId) activeSessionId = updated.id;
-        });
-        const extensionCleanup = await listen<ExtensionUiRequest>('pi://extension-ui-request', (event) => {
-          extensionRequest = event.payload;
-        });
-        const statusCleanup = await listen<StatusEvent>('pi://status', (event) => {
-          const next = new Map(sessionStatuses);
-          next.set(event.payload.session_id, event.payload.statuses);
-          sessionStatuses = next;
-        });
-        const widgetCleanup = await listen<WidgetEvent>('pi://widget', (event) => {
-          const next = new Map(sessionWidgets);
-          next.set(event.payload.session_id, event.payload.widgets);
-          sessionWidgets = next;
-        });
-        const notifyCleanup = await listen<NotifyEvent>('pi://notify', (event) => {
-          const { session_id, message, level } = event.payload;
-          sessions = sessions.map((session) => session.id === session_id ? {
-            ...session,
-            messages: [...session.messages, {
-              id: `${session_id}-notify-${Date.now()}`,
-              role: 'status',
-              content: `${level}: ${stripAnsi(message)}`,
-              timestamp: Date.now()
-            }]
-          } : session);
-        });
-        const editorTextCleanup = await listen<EditorTextEvent>('pi://editor-text', (event) => {
-          if (activeSession && event.payload.session_id === activeSession.id) {
-            draft = event.payload.text;
           }
         });
+
         if (disposed) {
-          messageCleanup();
-          sessionCleanup();
-          extensionCleanup();
-          statusCleanup();
-          widgetCleanup();
-          notifyCleanup();
-          editorTextCleanup();
+          listeners.forEach((cleanup) => cleanup());
           return;
         }
-        unlisteners = [messageCleanup, sessionCleanup, extensionCleanup, statusCleanup, widgetCleanup, notifyCleanup, editorTextCleanup];
+        unlisteners = listeners;
         await refreshSessions();
         await refreshPiImports();
         const importedSet = new Set(sessions.map((s) => s.pi_session_file).filter(Boolean));
@@ -1030,29 +949,7 @@
   {/if}
 
   {#if extensionRequest}
-    <section class="global-dialog panel" aria-label="Pi request">
-      <div class="panel-head">
-        <span>{extensionRequest.request.title ?? extensionRequest.request.method}</span>
-        <button on:click={() => respondToExtensionRequest({ cancelled: true })}>Cancel</button>
-      </div>
-      {#if extensionRequest.request.method === 'confirm'}
-        <p>{extensionRequest.request.message}</p>
-        <div class="dialog-actions">
-          <button on:click={() => respondToExtensionRequest({ confirmed: false })}>No</button>
-          <button class="primary-action" on:click={() => respondToExtensionRequest({ confirmed: true })}>Yes</button>
-        </div>
-      {:else if extensionRequest.request.method === 'select'}
-        <div class="choice-grid compact">
-          {#each extensionRequest.request.options ?? [] as option}
-            <button on:click={() => respondToExtensionRequest({ value: option.value ?? option.id ?? option })}><strong>{option.label ?? option.name ?? option.value ?? option}</strong></button>
-          {/each}
-        </div>
-      {:else if extensionRequest.request.method === 'input'}
-        <input class="model-search" placeholder={extensionRequest.request.placeholder ?? ''} on:keydown={(event) => event.key === 'Enter' && respondToExtensionRequest({ value: (event.currentTarget as HTMLInputElement).value })} />
-      {:else}
-        <p>{JSON.stringify(extensionRequest.request)}</p>
-      {/if}
-    </section>
+    <ExtensionRequestDialog extensionRequest={extensionRequest} onRespond={respondToExtensionRequest} />
   {/if}
 
   <div class="fps-overlay">fps: {fps}</div>

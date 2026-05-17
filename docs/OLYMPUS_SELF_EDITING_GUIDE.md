@@ -11,12 +11,18 @@ If your goal is “change behavior quickly without breaking integration,” star
 ## Frontend (renderer)
 
 - `src/App.svelte`
-  - Main UI surface (currently monolithic)
-  - Pane logic (`home | chat | search | settings`)
-  - Session list + transcript rendering
-  - Slash command interception
-  - Tauri event listeners
-  - Tauri command invocation calls
+  - Main app composition/orchestration
+  - Still contains significant behavior, but shared logic has started moving into `src/lib/`
+- `src/lib/types/pi.ts`
+  - Shared frontend types and constants (sessions, events, panes, presets)
+- `src/lib/utils/pi.ts`
+  - Shared formatting/filtering helpers (`stripAnsi`, command ranking, relative time, etc.)
+- `src/lib/services/piClient.ts`
+  - Centralized Tauri invoke wrappers for pi-related commands
+- `src/lib/services/piEvents.ts`
+  - Centralized attachment of `pi://...` listeners
+- `src/lib/components/ExtensionRequestDialog.svelte`
+  - Extracted extension-request modal UI component
 - `src/styles.css`
   - Main styling rules
 - `src/animations.ts`
@@ -27,12 +33,13 @@ If your goal is “change behavior quickly without breaking integration,” star
 ## Backend (runtime + IPC)
 
 - `src-tauri/src/lib.rs`
-  - Session store and lifecycle
-  - pi child process spawning
-  - RPC command writing
-  - stdout/stderr parsing threads
-  - Tauri command handlers
-  - Tauri event emission
+  - Runtime composition root + command/event orchestration
+- `src-tauri/src/state.rs`
+  - Core backend state and shared backend models (`SessionStore`, `PiSession`, event payload structs)
+- `src-tauri/src/persistence.rs`
+  - Session persistence (`save_sessions`, `load_sessions`, app data path management)
+- `src-tauri/src/pi_events.rs`
+  - Emission/status/stream helper logic for message/status transitions
 - `src-tauri/src/pi_import.rs`
   - Discovery/import of existing pi sessions from local disk
 - `src-tauri/src/main.rs`

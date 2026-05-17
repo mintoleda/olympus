@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::ChatMessage;
+use crate::state::ChatMessage;
 
 const META_SCAN_LINES: usize = 200;
 const META_SCAN_BYTES: usize = 64 * 1024;

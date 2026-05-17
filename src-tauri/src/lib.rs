@@ -1,80 +1,32 @@
+mod persistence;
+mod pi_events;
 mod pi_import;
+mod state;
 
-use serde::{Deserialize, Serialize};
+use persistence::{load_sessions, persist_store, save_sessions};
+use pi_events::{
+    append_assistant_delta, append_thinking_delta, emit_message, emit_session_update,
+    finalize_assistant, finalize_thinking, mark_status,
+};
 use serde_json::Value;
+use state::{
+    now_ms, project_name, ChatMessage, EditorTextEvent, ExtensionUiRequest, NotifyEvent,
+    PiCommandOption, PiModelOption, PiSession, RunningSession, SessionStore, StatusEntry,
+    StatusEvent, TitleEvent, WidgetEntry, WidgetEvent,
+};
 use std::{
-    collections::HashMap,
-    fs,
     io::{BufRead, BufReader, Write},
-    path::{Path, PathBuf},
-    process::{Child, ChildStdin, Command, Stdio},
+    path::Path,
+    process::{ChildStdin, Command, Stdio},
     sync::{
-        atomic::{AtomicU64, Ordering},
-        mpsc::{sync_channel, SyncSender},
+        atomic::Ordering,
+        mpsc::sync_channel,
         Arc, Mutex,
     },
     thread,
     time::Duration,
 };
 use tauri::{AppHandle, Emitter, Manager, State};
-
-#[derive(Clone, Serialize, Deserialize)]
-pub(crate) struct ChatMessage {
-    pub(crate) id: String,
-    pub(crate) role: String,
-    pub(crate) content: String,
-    pub(crate) timestamp: u64,
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    pub(crate) msg_type: Option<String>,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-struct PiSession {
-    id: String,
-    name: String,
-    project_path: String,
-    status: String,
-    messages: Vec<ChatMessage>,
-    session_dir: String,
-    pi_session_id: Option<String>,
-    pi_session_file: Option<String>,
-    model: Option<String>,
-    model_id: Option<String>,
-    provider: Option<String>,
-    thinking_level: Option<String>,
-}
-
-#[derive(Clone, Serialize)]
-struct SessionEvent {
-    session_id: String,
-    message: ChatMessage,
-}
-
-#[derive(Clone, Serialize)]
-struct SessionUpdateEvent {
-    session: PiSession,
-}
-
-#[derive(Clone, Serialize)]
-struct PiModelOption {
-    provider: String,
-    id: String,
-    context: String,
-    max_output: String,
-    reasoning: bool,
-    images: bool,
-}
-
-#[derive(Clone, Serialize)]
-struct PiCommandOption {
-    name: String,
-    description: String,
-    source: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    location: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    path: Option<String>,
-}
 
 const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("model", "Switch model"),
@@ -92,252 +44,6 @@ const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("logout", "Remove provider authentication"),
     ("quit", "Exit pi"),
 ];
-
-#[derive(Clone, Serialize)]
-struct ExtensionUiRequest {
-    session_id: String,
-    request: Value,
-}
-
-#[derive(Clone, Serialize)]
-struct StatusEntry {
-    key: String,
-    text: String,
-}
-
-#[derive(Clone, Serialize)]
-struct StatusEvent {
-    session_id: String,
-    statuses: Vec<StatusEntry>,
-}
-
-#[derive(Clone, Serialize)]
-struct WidgetEntry {
-    key: String,
-    lines: Vec<String>,
-    placement: String,
-}
-
-#[derive(Clone, Serialize)]
-struct WidgetEvent {
-    session_id: String,
-    widgets: Vec<WidgetEntry>,
-}
-
-#[derive(Clone, Serialize)]
-struct NotifyEvent {
-    session_id: String,
-    message: String,
-    level: String,
-}
-
-#[derive(Clone, Serialize)]
-struct TitleEvent {
-    session_id: String,
-    title: String,
-}
-
-#[derive(Clone, Serialize)]
-struct EditorTextEvent {
-    session_id: String,
-    text: String,
-}
-
-#[derive(Clone)]
-struct RunningSession {
-    child: Arc<Mutex<Child>>,
-    stdin: Arc<Mutex<ChildStdin>>,
-}
-
-#[derive(Default)]
-struct SessionStore {
-    sessions: Mutex<HashMap<String, PiSession>>,
-    runtimes: Mutex<HashMap<String, RunningSession>>,
-    active: Mutex<Option<String>>,
-    counter: AtomicU64,
-    pending_commands: Mutex<HashMap<String, SyncSender<Vec<PiCommandOption>>>>,
-    last_commands: Mutex<HashMap<String, Vec<PiCommandOption>>>,
-    session_statuses: Mutex<HashMap<String, Vec<StatusEntry>>>,
-    session_widgets: Mutex<HashMap<String, Vec<WidgetEntry>>>,
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
-fn project_name(path: &str) -> String {
-    PathBuf::from(path)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
-        .unwrap_or("workspace")
-        .to_string()
-}
-
-fn sessions_path(app: &AppHandle) -> Result<PathBuf, String> {
-    let dir = app.path().app_data_dir().map_err(|err| err.to_string())?;
-    fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
-    Ok(dir.join("sessions.json"))
-}
-
-fn save_sessions(app: &AppHandle, sessions: &HashMap<String, PiSession>) -> Result<(), String> {
-    let path = sessions_path(app)?;
-    let sessions: Vec<_> = sessions.values().cloned().collect();
-    let json = serde_json::to_string_pretty(&sessions).map_err(|err| err.to_string())?;
-    fs::write(path, json).map_err(|err| err.to_string())
-}
-
-fn persist_store(app: &AppHandle, store: &SessionStore) {
-    if let Ok(sessions) = store.sessions.lock() {
-        let _ = save_sessions(app, &sessions);
-    }
-}
-
-fn load_sessions(app: &AppHandle, store: &SessionStore) {
-    let Ok(path) = sessions_path(app) else { return };
-    let Ok(json) = fs::read_to_string(path) else {
-        return;
-    };
-    let Ok(sessions) = serde_json::from_str::<Vec<PiSession>>(&json) else {
-        return;
-    };
-    let mut max_suffix: u64 = 0;
-    if let Ok(mut map) = store.sessions.lock() {
-        for mut session in sessions {
-            if let Some(suffix) = session
-                .id
-                .strip_prefix("session-")
-                .and_then(|s| s.parse::<u64>().ok())
-            {
-                if suffix > max_suffix {
-                    max_suffix = suffix;
-                }
-            }
-            session.status = "idle".into();
-            map.insert(session.id.clone(), session);
-        }
-    }
-    store.counter.store(max_suffix, Ordering::Relaxed);
-}
-
-fn emit_message(app: &AppHandle, session_id: &str, message: ChatMessage) {
-    let _ = app.emit(
-        "pi://message",
-        SessionEvent {
-            session_id: session_id.to_string(),
-            message,
-        },
-    );
-}
-
-fn emit_session_update(app: &AppHandle, session: PiSession) {
-    let _ = app.emit("pi://session", SessionUpdateEvent { session });
-}
-
-fn mark_status(app: &AppHandle, session_id: &str, status: &str) {
-    let store = app.state::<SessionStore>();
-    if let Ok(mut sessions) = store.sessions.lock() {
-        if let Some(session) = sessions.get_mut(session_id) {
-            session.status = status.into();
-        }
-        let _ = save_sessions(app, &sessions);
-    }
-    emit_message(
-        app,
-        session_id,
-        ChatMessage {
-            id: format!("{session_id}-status-{}", now_ms()),
-            role: "status".into(),
-            content: status.into(),
-            timestamp: now_ms(),
-            msg_type: None,
-        },
-    );
-}
-
-fn append_assistant_delta(app: &AppHandle, session_id: &str, message_id: &str, delta: &str) {
-    emit_message(
-        app,
-        session_id,
-        ChatMessage {
-            id: message_id.into(),
-            role: "assistant".into(),
-            content: delta.into(),
-            timestamp: now_ms(),
-            msg_type: None,
-        },
-    );
-}
-
-fn append_thinking_delta(app: &AppHandle, session_id: &str, message_id: &str, delta: &str) {
-    emit_message(
-        app,
-        session_id,
-        ChatMessage {
-            id: message_id.into(),
-            role: "assistant".into(),
-            content: delta.into(),
-            timestamp: now_ms(),
-            msg_type: Some("thinking".into()),
-        },
-    );
-}
-
-fn finalize_assistant(app: &AppHandle, session_id: &str, message_id: &str, content: String) {
-    let store = app.state::<SessionStore>();
-    if let Ok(mut sessions) = store.sessions.lock() {
-        if let Some(session) = sessions.get_mut(session_id) {
-            session.messages.push(ChatMessage {
-                id: message_id.into(),
-                role: "assistant".into(),
-                content: if content.trim().is_empty() {
-                    "Pi returned no output.".into()
-                } else {
-                    content
-                },
-                timestamp: now_ms(),
-                msg_type: None,
-            });
-            session.status = "idle".into();
-        }
-        let _ = save_sessions(app, &sessions);
-    }
-    emit_message(
-        app,
-        session_id,
-        ChatMessage {
-            id: format!("{session_id}-done-{}", now_ms()),
-            role: "status".into(),
-            content: "idle".into(),
-            timestamp: now_ms(),
-            msg_type: None,
-        },
-    );
-}
-
-fn finalize_thinking(app: &AppHandle, session_id: &str, message_id: &str, content: String) {
-    if content.trim().is_empty() {
-        return;
-    }
-    {
-        let store = app.state::<SessionStore>();
-        if let Ok(mut sessions) = store.sessions.lock() {
-            if let Some(session) = sessions.get_mut(session_id) {
-                session.messages.push(ChatMessage {
-                    id: message_id.into(),
-                    role: "assistant".into(),
-                    content,
-                    timestamp: now_ms(),
-                    msg_type: Some("thinking".into()),
-                });
-            }
-            let _ = save_sessions(app, &sessions);
-        };
-    }
-}
 
 fn value_string(value: Option<&Value>) -> Option<String> {
     value.and_then(|value| match value {
