@@ -17,7 +17,7 @@
   import type { Scope } from 'animejs';
 
   type PaneId = 'home' | 'chat' | 'search' | 'settings';
-  type ChatMessage = { id: string; role: 'user' | 'assistant' | 'status'; content: string; timestamp: number; type?: string };
+  type ChatMessage = { id: string; role: 'user' | 'assistant' | 'status' | 'system'; content: string; timestamp: number; type?: string };
   type PiSession = {
     id: string;
     name: string;
@@ -197,7 +197,7 @@
   }
   $: if (animationReady && rootEl && activeSession?.status && activeSession.status !== lastAnimatedStatus) {
     lastAnimatedStatus = activeSession.status;
-    if (activeSession.status === 'streaming') tick().then(() => animateStreamingStatus(rootEl));
+    if (['streaming','waiting','resetting'].includes(activeSession.status)) tick().then(() => animateStreamingStatus(rootEl));
   }
 
   const timeFormatter = new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit' });
@@ -436,6 +436,12 @@
         return true;
       case 'new':
         await createSession();
+        return true;
+      case 'clear':
+        if (activeSession) await runAction(() => invoke('reset_pi_session', { id: activeSession!.id }));
+        return true;
+      case 'fork':
+        await createSession(activeSession?.project_path);
         return true;
       case 'compact':
         await runAction(() => invoke('compact_session', { id: activeSession!.id, customInstructions: args || null }));
@@ -748,7 +754,7 @@
                 on:click={() => cyclePrimary(1)}
                 title="Cycle plan → build → ask → off"
               ><small>primary</small><strong>{activePreset ?? 'off'}</strong></button>
-              <span class="pi-state" class:streaming={activeSession.status === 'streaming'}>{activeSession.status}</span>
+              <span class="pi-state" class:streaming={['streaming','thinking','generating','waiting','resetting','retrying','compacting'].includes(activeSession.status)}>{activeSession.status}</span>
             {/if}
             {#if activePane === 'chat' || activePane === 'home'}
               <button class="info-toggle" on:click={() => (infoCardVisible = !infoCardVisible)} title={infoCardVisible ? 'Hide info' : 'Show info'}>
@@ -762,23 +768,27 @@
           <div class="chat-body">
             <div class="transcript-head">
               <div><p class="eyebrow">Active transcript</p><p class="session-name">{activeSession.name}</p></div>
-              <span class="status-pill" class:streaming={['streaming','thinking','generating'].includes(activeSession.status)}>{activeSession.status}</span>
+              <span class="status-pill" class:streaming={['streaming','thinking','generating','waiting','resetting','retrying','compacting'].includes(activeSession.status)}>{activeSession.status}</span>
             </div>
             <div class="chat-log" bind:this={chatLogEl}>
               {#each activeSession.messages as message, index}
-                <article class="message {message.role}" style={`--i: ${index}`}>
-                  <header><span>{message.role}</span><time>{formatTime(message.timestamp)}</time></header>
-                  {#if message.type === 'thinking'}
-                    <details class="thinking-block" open>
-                      <summary>Thinking</summary>
-                      <pre>{message.content}</pre>
-                    </details>
-                  {:else if message.type === 'tool'}
-                    <p class="tool-call">{message.content}</p>
-                  {:else}
-                    <p>{message.content}</p>
-                  {/if}
-                </article>
+                {#if message.role === 'system'}
+                  <div class="chat-separator" style={`--i: ${index}`}><span>{message.content}</span></div>
+                {:else}
+                  <article class="message {message.role}" style={`--i: ${index}`}>
+                    <header><span>{message.role}</span><time>{formatTime(message.timestamp)}</time></header>
+                    {#if message.type === 'thinking'}
+                      <details class="thinking-block" open>
+                        <summary>Thinking</summary>
+                        <pre>{message.content}</pre>
+                      </details>
+                    {:else if message.type === 'tool'}
+                      <p class="tool-call">{message.content}</p>
+                    {:else}
+                      <p>{message.content}</p>
+                    {/if}
+                  </article>
+                {/if}
               {/each}
             </div>
             {#if nonPresetStatuses.length || aboveWidgets.length}
@@ -967,7 +977,7 @@
             <span class="tool-card__label">{activePane === 'chat' ? 'Pi wrapper' : 'Recent work'}</span>
             <div class="tool-card__actions">
               {#if activePane === 'chat'}
-                <small class="pi-state" class:streaming={activeSession?.status === 'streaming'}>{activeSession?.status ?? 'offline'}</small>
+                <small class="pi-state" class:streaming={['streaming','thinking','generating','waiting','resetting','retrying','compacting'].includes(activeSession?.status ?? '')}>{activeSession?.status ?? 'offline'}</small>
               {/if}
             </div>
           </div>

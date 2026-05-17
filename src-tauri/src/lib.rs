@@ -691,6 +691,14 @@ fn write_rpc(runtime: &RunningSession, request: Value) -> Result<(), String> {
     stdin.flush().map_err(|err| err.to_string())
 }
 
+fn write_get_state_via_stdin(stdin: &Arc<Mutex<ChildStdin>>, session_id: &str) {
+    if let Ok(mut guard) = stdin.lock() {
+        let msg = serde_json::json!({"id": format!("{session_id}-state-{}", now_ms()), "type": "get_state"});
+        let _ = writeln!(guard, "{msg}");
+        let _ = guard.flush();
+    }
+}
+
 fn request_pi_state(runtime: &RunningSession, session_id: &str) -> Result<(), String> {
     write_rpc(
         runtime,
@@ -768,6 +776,7 @@ fn spawn_pi_inner(
 
     let reader_app = app.clone();
     let reader_session_id = session_id.clone();
+    let reader_stdin = runtime.stdin.clone();
     thread::spawn(move || {
         let mut current_message_id = String::new();
         let mut full_response = String::new();
@@ -781,37 +790,65 @@ fn spawn_pi_inner(
             };
             match event.get("type").and_then(Value::as_str) {
                 Some("response") => {
-                    if event.get("command").and_then(Value::as_str) == Some("get_state") {
-                        if let Some(data) = event.get("data") {
-                            handle_state_response(&reader_app, &reader_session_id, data);
+                    let command = event.get("command").and_then(Value::as_str);
+                    let success = event.get("success").and_then(Value::as_bool).unwrap_or(false);
+                    match command {
+                        Some("get_state") => {
+                            if let Some(data) = event.get("data") {
+                                handle_state_response(&reader_app, &reader_session_id, data);
+                            }
                         }
-                    } else if event.get("command").and_then(Value::as_str) == Some("set_model")
-                        && event.get("success").and_then(Value::as_bool) == Some(true)
-                    {
-                        if let Some(data) = event.get("data") {
-                            handle_set_model_response(&reader_app, &reader_session_id, data);
+                        Some("set_model") if success => {
+                            if let Some(data) = event.get("data") {
+                                handle_set_model_response(&reader_app, &reader_session_id, data);
+                            }
                         }
-                    } else if event.get("command").and_then(Value::as_str) == Some("get_commands")
-                        && event.get("success").and_then(Value::as_bool) == Some(true)
-                    {
-                        handle_commands_response(&reader_app, &reader_session_id, &event);
-                    } else if event.get("success").and_then(Value::as_bool) == Some(false) {
-                        let text = event
-                            .get("error")
-                            .map(Value::to_string)
-                            .unwrap_or_else(|| "Pi rejected command".into());
-                        emit_message(
-                            &reader_app,
-                            &reader_session_id,
-                            ChatMessage {
-                                id: format!("{reader_session_id}-err-{}", now_ms()),
-                                role: "assistant".into(),
-                                content: text,
-                                timestamp: now_ms(),
-                                msg_type: None,
-                            },
-                        );
-                        mark_status(&reader_app, &reader_session_id, "idle");
+                        Some("get_commands") if success => {
+                            handle_commands_response(&reader_app, &reader_session_id, &event);
+                        }
+                        Some("new_session") if success => {
+                            // Pi created a new session; clean up stream state, add separator, sync state
+                            current_message_id.clear();
+                            full_response.clear();
+                            current_thinking_id.clear();
+                            thinking_response.clear();
+                            emit_message(
+                                &reader_app,
+                                &reader_session_id,
+                                ChatMessage {
+                                    id: format!("{reader_session_id}-reset-{}", now_ms()),
+                                    role: "system".into(),
+                                    content: "── session reset ──".into(),
+                                    timestamp: now_ms(),
+                                    msg_type: Some("separator".into()),
+                                },
+                            );
+                            mark_status(&reader_app, &reader_session_id, "idle");
+                            write_get_state_via_stdin(&reader_stdin, &reader_session_id);
+                        }
+                        Some("compact") if success => {
+                            mark_status(&reader_app, &reader_session_id, "idle");
+                            write_get_state_via_stdin(&reader_stdin, &reader_session_id);
+                        }
+                        _ if !success => {
+                            let text = event
+                                .get("error")
+                                .map(Value::to_string)
+                                .unwrap_or_else(|| "Pi rejected command".into());
+                            emit_message(
+                                &reader_app,
+                                &reader_session_id,
+                                ChatMessage {
+                                    id: format!("{reader_session_id}-err-{}", now_ms()),
+                                    role: "assistant".into(),
+                                    content: text,
+                                    timestamp: now_ms(),
+                                    msg_type: None,
+                                },
+                            );
+                            mark_status(&reader_app, &reader_session_id, "idle");
+                        }
+                        _ => {}
                     }
                 }
                 Some("extension_ui_request") => {
@@ -850,6 +887,50 @@ fn spawn_pi_inner(
                         }
                         _ => {}
                     }
+                }
+                Some("extension_error") => {
+                    let msg = event
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Pi extension error");
+                    emit_message(
+                        &reader_app,
+                        &reader_session_id,
+                        ChatMessage {
+                            id: format!("{reader_session_id}-ext-err-{}", now_ms()),
+                            role: "assistant".into(),
+                            content: format!("Extension error: {msg}"),
+                            timestamp: now_ms(),
+                            msg_type: None,
+                        },
+                    );
+                    mark_status(&reader_app, &reader_session_id, "idle");
+                }
+                Some("compaction_start") => {
+                    mark_status(&reader_app, &reader_session_id, "compacting");
+                }
+                Some("compaction_end") => {
+                    current_message_id.clear();
+                    full_response.clear();
+                    mark_status(&reader_app, &reader_session_id, "idle");
+                    write_get_state_via_stdin(&reader_stdin, &reader_session_id);
+                }
+                Some("tool_execution_start") => {
+                    let tool_name = event
+                        .get("toolName")
+                        .or_else(|| event.get("tool_name"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("tool");
+                    mark_status(&reader_app, &reader_session_id, &format!("running:{tool_name}"));
+                }
+                Some("tool_execution_end") => {
+                    mark_status(&reader_app, &reader_session_id, "streaming");
+                }
+                Some("auto_retry_start") => {
+                    mark_status(&reader_app, &reader_session_id, "retrying");
+                }
+                Some("auto_retry_end") => {
+                    mark_status(&reader_app, &reader_session_id, "streaming");
                 }
                 Some("agent_start") => {
                     current_message_id = format!("{reader_session_id}-a-{}", now_ms());
@@ -907,6 +988,39 @@ fn spawn_pi_inner(
                                     delta,
                                 );
                             }
+                        }
+                        Some("done") => {
+                            // Message-level stream finished cleanly (pi may still emit agent_end)
+                            if !current_message_id.is_empty() {
+                                finalize_assistant(
+                                    &reader_app,
+                                    &reader_session_id,
+                                    &current_message_id,
+                                    full_response.clone(),
+                                );
+                                current_message_id.clear();
+                                full_response.clear();
+                            }
+                        }
+                        Some("error") => {
+                            let msg = delta_event
+                                .get("error")
+                                .and_then(Value::as_str)
+                                .unwrap_or("stream error");
+                            emit_message(
+                                &reader_app,
+                                &reader_session_id,
+                                ChatMessage {
+                                    id: format!("{reader_session_id}-serr-{}", now_ms()),
+                                    role: "assistant".into(),
+                                    content: format!("Stream error: {msg}"),
+                                    timestamp: now_ms(),
+                                    msg_type: None,
+                                },
+                            );
+                            current_message_id.clear();
+                            full_response.clear();
+                            mark_status(&reader_app, &reader_session_id, "idle");
                         }
                         _ => {}
                     }
@@ -1024,6 +1138,21 @@ fn create_session(
 
 fn spawn_pi_unit(app: AppHandle, session_id: String) -> Result<(), String> {
     spawn_pi(app, session_id).map(|_| ())
+}
+
+#[tauri::command]
+fn reset_pi_session(
+    id: String,
+    app: AppHandle,
+    store: State<'_, SessionStore>,
+) -> Result<(), String> {
+    let _ = store;
+    mark_status(&app, &id, "resetting");
+    let runtime = spawn_pi(app, id.clone())?;
+    write_rpc(
+        &runtime,
+        serde_json::json!({"id": format!("{id}-reset-{}", now_ms()), "type": "new_session"}),
+    )
 }
 
 #[tauri::command]
@@ -1492,11 +1621,18 @@ fn send_message(
             .lock()
             .map_err(|_| "session store poisoned")?;
         let session = sessions.get_mut(&id).ok_or("session not found")?;
-        if session.status == "streaming" {
+        if session.status == "streaming" || session.status == "waiting" {
             return Err("session is already streaming".into());
         }
         session.messages.push(user_message.clone());
-        session.status = "streaming".into();
+        // Slash commands that are session-control ops won't emit agent_start/agent_end,
+        // so don't pre-set "streaming" — let agent_start set it. Use "waiting" so
+        // the reader thread's new_session/idle responses can clear it without getting stuck.
+        session.status = if content.trim_start().starts_with('/') {
+            "waiting".into()
+        } else {
+            "streaming".into()
+        };
         save_sessions(&app, &sessions)?;
     }
     emit_message(&app, &id, user_message);
@@ -1555,7 +1691,8 @@ pub fn run() {
             send_message,
             send_pi_command,
             list_pi_imports,
-            import_pi_session
+            import_pi_session,
+            reset_pi_session
         ])
         .setup(|app| {
             let handle = app.handle().clone();
