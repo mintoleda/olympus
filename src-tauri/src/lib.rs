@@ -1,10 +1,12 @@
+mod pi_import;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::HashMap,
     fs,
     io::{BufRead, BufReader, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -17,13 +19,13 @@ use std::{
 use tauri::{AppHandle, Emitter, Manager, State};
 
 #[derive(Clone, Serialize, Deserialize)]
-struct ChatMessage {
-    id: String,
-    role: String,
-    content: String,
-    timestamp: u64,
+pub(crate) struct ChatMessage {
+    pub(crate) id: String,
+    pub(crate) role: String,
+    pub(crate) content: String,
+    pub(crate) timestamp: u64,
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    msg_type: Option<String>,
+    pub(crate) msg_type: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -976,6 +978,11 @@ fn create_session(
             .unwrap_or_else(|_| "~".into())
     });
     let id = format!("session-{id_num}");
+    let defaults = pi_import::read_pi_defaults();
+    let (provider, model_id_default, thinking_level) = match defaults {
+        Some(d) => (d.provider, d.model, d.thinking_level),
+        None => (None, None, None),
+    };
     let session = PiSession {
         id: id.clone(),
         name: project_name(&project_path),
@@ -993,10 +1000,10 @@ fn create_session(
         session_dir: String::new(),
         pi_session_id: None,
         pi_session_file: None,
-        model: None,
-        model_id: None,
-        provider: None,
-        thinking_level: None,
+        model: model_id_default.clone(),
+        model_id: model_id_default,
+        provider,
+        thinking_level,
     };
 
     {
@@ -1017,6 +1024,119 @@ fn create_session(
 
 fn spawn_pi_unit(app: AppHandle, session_id: String) -> Result<(), String> {
     spawn_pi(app, session_id).map(|_| ())
+}
+
+#[tauri::command]
+fn list_pi_imports(
+    project_path: Option<String>,
+) -> Result<Vec<pi_import::PiSessionMeta>, String> {
+    Ok(pi_import::discover_pi_sessions(project_path.as_deref()))
+}
+
+#[tauri::command]
+fn import_pi_session(
+    session_file: String,
+    app: AppHandle,
+    store: State<'_, SessionStore>,
+) -> Result<PiSession, String> {
+    let sessions_root = pi_import::sessions_root().ok_or("Pi sessions directory not found")?;
+    let candidate = Path::new(&session_file)
+        .canonicalize()
+        .map_err(|err| format!("Invalid session file: {err}"))?;
+    let root_canonical = sessions_root
+        .canonicalize()
+        .map_err(|err| format!("Invalid pi sessions root: {err}"))?;
+    if !candidate.starts_with(&root_canonical) {
+        return Err("Session file is outside the pi sessions directory".into());
+    }
+    let canonical_str = candidate.to_string_lossy().to_string();
+
+    {
+        let sessions = store
+            .sessions
+            .lock()
+            .map_err(|_| "session store poisoned")?;
+        for existing in sessions.values() {
+            if existing.pi_session_file.as_deref() == Some(canonical_str.as_str()) {
+                let existing_id = existing.id.clone();
+                drop(sessions);
+                *store
+                    .active
+                    .lock()
+                    .map_err(|_| "active session lock poisoned")? = Some(existing_id.clone());
+                let session = store
+                    .sessions
+                    .lock()
+                    .map_err(|_| "session store poisoned")?
+                    .get(&existing_id)
+                    .cloned()
+                    .ok_or("session vanished")?;
+                spawn_pi(app, existing_id)?;
+                return Ok(session);
+            }
+        }
+    }
+
+    let meta = pi_import::read_session_meta(&candidate)
+        .ok_or("Could not read pi session metadata")?;
+
+    let id_num = store.counter.fetch_add(1, Ordering::Relaxed) + 1;
+    let id = format!("session-{id_num}");
+
+    let cwd_exists = Path::new(&meta.project_path).is_dir();
+    let mut messages = pi_import::parse_pi_messages(&canonical_str);
+    let project_path = if cwd_exists {
+        meta.project_path.clone()
+    } else {
+        let fallback = std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| meta.project_path.clone());
+        messages.push(ChatMessage {
+            id: format!("session-{id_num}-cwd-warning"),
+            role: "assistant".into(),
+            content: format!(
+                "⚠ Original project path `{}` no longer exists; running from `{}`.",
+                meta.project_path, fallback
+            ),
+            timestamp: now_ms(),
+            msg_type: None,
+        });
+        fallback
+    };
+
+    let session = PiSession {
+        id: id.clone(),
+        name: project_name(&project_path),
+        project_path,
+        status: "starting".into(),
+        messages,
+        session_dir: String::new(),
+        pi_session_id: if meta.session_id.is_empty() {
+            None
+        } else {
+            Some(meta.session_id.clone())
+        },
+        pi_session_file: Some(canonical_str.clone()),
+        model: meta.model_id.clone(),
+        model_id: meta.model_id.clone(),
+        provider: meta.provider.clone(),
+        thinking_level: meta.thinking_level.clone(),
+    };
+
+    {
+        let mut sessions = store
+            .sessions
+            .lock()
+            .map_err(|_| "session store poisoned")?;
+        sessions.insert(session.id.clone(), session.clone());
+        save_sessions(&app, &sessions)?;
+    }
+    *store
+        .active
+        .lock()
+        .map_err(|_| "active session lock poisoned")? = Some(session.id.clone());
+    spawn_pi(app, session.id.clone())?;
+    Ok(session)
 }
 
 #[tauri::command]
@@ -1433,7 +1553,9 @@ pub fn run() {
             stop_session,
             close_session,
             send_message,
-            send_pi_command
+            send_pi_command,
+            list_pi_imports,
+            import_pi_session
         ])
         .setup(|app| {
             let handle = app.handle().clone();

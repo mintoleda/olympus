@@ -530,6 +530,10 @@ h1 {
 .message.status { align-self: center; width: min(92%, 820px); border-left-color: var(--faint); }
 .message header { display: flex; justify-content: space-between; gap: 12px; margin-bottom: 7px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.12em; font-size: 0.58rem; }
 .message p { margin: 0; color: var(--paper); line-height: 1.45; white-space: pre-wrap; }
+.thinking-block { margin: 0; }
+.thinking-block summary { cursor: pointer; color: var(--muted); font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.08em; user-select: none; }
+.thinking-block pre { margin: 6px 0 0; padding: 8px 10px; background: rgba(255,255,255,0.03); border-left: 2px solid var(--faint); color: var(--muted); font-size: 0.78rem; line-height: 1.4; white-space: pre-wrap; overflow-wrap: break-word; }
+.tool-call { margin: 0; color: var(--muted); font-size: 0.8rem; font-style: italic; }
 
 /* ── Status feed ── */
 
@@ -828,6 +832,43 @@ h1 {
 .recent-list strong { font-size: 0.8rem; }
 .recent-list small { color: var(--muted); font-size: 0.62rem; }
 .recent-list em { grid-column: 3; grid-row: 1 / 3; color: var(--accent); font-style: normal; font-size: 0.64rem; }
+
+/* ── Pi imports ── */
+
+.pi-imports { display: grid; gap: 8px; min-height: 0; }
+.pi-imports .panel-head { display: flex; justify-content: space-between; align-items: baseline; }
+.pi-import-list { display: grid; gap: 6px; min-height: 0; overflow: auto; max-height: 320px; }
+.pi-import-row {
+  display: grid;
+  gap: 4px;
+  width: 100%;
+  padding: 10px 12px;
+  color: var(--paper);
+  text-align: left;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--base-2);
+  cursor: pointer;
+  transition: transform 140ms ease, border-color 140ms ease, background 140ms ease;
+}
+.pi-import-row:hover { border-color: var(--accent); background: #202318; transform: translateX(3px); }
+.pi-import-row:disabled { opacity: 0.55; cursor: progress; transform: none; }
+.pi-import-row.busy { border-color: var(--accent); }
+.pi-import-row__head { display: flex; justify-content: space-between; gap: 10px; align-items: baseline; }
+.pi-import-row__head strong { font-size: 0.82rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pi-import-row__head small { color: var(--faint); font-size: 0.6rem; flex-shrink: 0; }
+.pi-import-row__path { color: var(--muted); font-size: 0.6rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: inherit; }
+.pi-import-row__preview {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.72rem;
+  line-height: 1.4;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.pi-import-row__meta { display: flex; gap: 8px; flex-wrap: wrap; font-size: 0.58rem; color: var(--faint); text-transform: uppercase; letter-spacing: 0.08em; }
 
 /* ── Focus & keyframes ── */
 

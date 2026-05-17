@@ -17,7 +17,7 @@
   import type { Scope } from 'animejs';
 
   type PaneId = 'home' | 'chat' | 'search' | 'settings';
-  type ChatMessage = { id: string; role: 'user' | 'assistant' | 'status'; content: string; timestamp: number };
+  type ChatMessage = { id: string; role: 'user' | 'assistant' | 'status'; content: string; timestamp: number; type?: string };
   type PiSession = {
     id: string;
     name: string;
@@ -29,6 +29,18 @@
     model?: string | null;
     model_id?: string | null;
     provider?: string | null;
+    thinking_level?: string | null;
+  };
+  type PiSessionMeta = {
+    session_id: string;
+    session_file: string;
+    project_path: string;
+    started_at: string;
+    last_activity_ms: number;
+    message_count: number;
+    preview: string;
+    provider?: string | null;
+    model_id?: string | null;
     thinking_level?: string | null;
   };
   type SessionEvent = { session_id: string; message: ChatMessage };
@@ -80,6 +92,9 @@
   let lastAnimatedCollapsed = sessionsCollapsed;
   let menuOpen = false;
   let infoCardVisible = true;
+  let pendingPiImports: PiSessionMeta[] = [];
+  let piImportsLoaded = false;
+  let piImportBusy = '';
 
   function menuClickOutside(node: HTMLElement) {
     const handle = (e: MouseEvent) => {
@@ -107,6 +122,8 @@
   $: recentSessions = [...sessions]
     .sort((a, b) => latestTimestamp(b) - latestTimestamp(a))
     .slice(0, 6);
+  $: importedFiles = new Set(sessions.map((s) => s.pi_session_file).filter((p): p is string => !!p));
+  $: visiblePiImports = pendingPiImports.filter((meta) => !importedFiles.has(meta.session_file));
   $: activeProjectName = activeSession?.project_path.split('/').filter(Boolean).at(-1) ?? 'workspace';
   $: piRuntimeFacts = [
     { key: 'provider' as const, label: 'Provider', value: activeSession?.provider ?? 'detecting', note: 'current Pi backend' },
@@ -237,6 +254,54 @@
     }
   }
 
+  async function refreshPiImports() {
+    try {
+      pendingPiImports = await invoke<PiSessionMeta[]>('list_pi_imports', { projectPath: null });
+    } catch (err) {
+      pendingPiImports = [];
+      error = String(err);
+    } finally {
+      piImportsLoaded = true;
+    }
+  }
+
+  async function importPiSession(meta: PiSessionMeta) {
+    if (piImportBusy) return;
+    piImportBusy = meta.session_file;
+    const session = await runAction(() => invoke<PiSession>('import_pi_session', { sessionFile: meta.session_file }));
+    piImportBusy = '';
+    if (!session) return;
+    sessions = [...sessions.filter((item) => item.id !== session.id), session];
+    activeSessionId = session.id;
+    activePane = 'chat';
+    await refreshSessions();
+    await refreshPiImports();
+    await scrollChatToBottom();
+  }
+
+  function piImportPreview(meta: PiSessionMeta): string {
+    const trimmed = meta.preview.trim();
+    if (trimmed) return trimmed;
+    return `${meta.message_count} message${meta.message_count === 1 ? '' : 's'}`;
+  }
+
+  function relativeTime(ms: number): string {
+    if (!ms) return '';
+    const diff = Date.now() - ms;
+    if (diff < 0) return 'just now';
+    const sec = Math.floor(diff / 1000);
+    if (sec < 60) return `${sec}s ago`;
+    const min = Math.floor(sec / 60);
+    if (min < 60) return `${min}m ago`;
+    const hr = Math.floor(min / 60);
+    if (hr < 24) return `${hr}h ago`;
+    const day = Math.floor(hr / 24);
+    if (day < 30) return `${day}d ago`;
+    const mo = Math.floor(day / 30);
+    if (mo < 12) return `${mo}mo ago`;
+    return `${Math.floor(mo / 12)}y ago`;
+  }
+
   async function runAction<T>(fn: () => Promise<T>): Promise<T | undefined> {
     try {
       const result = await fn();
@@ -255,6 +320,7 @@
     activeSessionId = session.id;
     activePane = 'chat';
     await refreshSessions();
+    await refreshPiImports();
     await scrollChatToBottom();
   }
 
@@ -281,6 +347,7 @@
     const ok = await runAction(() => invoke('close_session', { id }));
     if (ok === undefined) return;
     await refreshSessions();
+    await refreshPiImports();
   }
 
   async function send() {
@@ -609,7 +676,10 @@
         }
         unlisteners = [messageCleanup, sessionCleanup, extensionCleanup, statusCleanup, widgetCleanup, notifyCleanup, editorTextCleanup];
         await refreshSessions();
-        if (sessions.length === 0) await createSession();
+        await refreshPiImports();
+        const importedSet = new Set(sessions.map((s) => s.pi_session_file).filter(Boolean));
+        const hasResumable = pendingPiImports.some((meta) => !importedSet.has(meta.session_file));
+        if (sessions.length === 0 && !hasResumable) await createSession();
       } catch (err) {
         error = String(err);
       }
@@ -692,13 +762,22 @@
           <div class="chat-body">
             <div class="transcript-head">
               <div><p class="eyebrow">Active transcript</p><p class="session-name">{activeSession.name}</p></div>
-              <span class="status-pill" class:streaming={activeSession.status === 'streaming'}>{activeSession.status}</span>
+              <span class="status-pill" class:streaming={['streaming','thinking','generating'].includes(activeSession.status)}>{activeSession.status}</span>
             </div>
             <div class="chat-log" bind:this={chatLogEl}>
               {#each activeSession.messages as message, index}
                 <article class="message {message.role}" style={`--i: ${index}`}>
                   <header><span>{message.role}</span><time>{formatTime(message.timestamp)}</time></header>
-                  <p>{message.content}</p>
+                  {#if message.type === 'thinking'}
+                    <details class="thinking-block" open>
+                      <summary>Thinking</summary>
+                      <pre>{message.content}</pre>
+                    </details>
+                  {:else if message.type === 'tool'}
+                    <p class="tool-call">{message.content}</p>
+                  {:else}
+                    <p>{message.content}</p>
+                  {/if}
                 </article>
               {/each}
             </div>
@@ -833,6 +912,40 @@
                   <small>{stat.note}</small>
                 </article>
               {/each}
+            </section>
+            <section class="pi-imports" aria-label="Resume from pi">
+              <div class="panel-head">
+                <span class="eyebrow">Resume from pi</span>
+                <small>{visiblePiImports.length} found</small>
+              </div>
+              {#if visiblePiImports.length}
+                <div class="pi-import-list">
+                  {#each visiblePiImports as meta (meta.session_file)}
+                    <button
+                      class="pi-import-row"
+                      class:busy={piImportBusy === meta.session_file}
+                      disabled={!!piImportBusy}
+                      on:click={() => importPiSession(meta)}
+                    >
+                      <div class="pi-import-row__head">
+                        <strong>{meta.project_path.split('/').filter(Boolean).at(-1) ?? meta.project_path}</strong>
+                        <small>{relativeTime(meta.last_activity_ms)}</small>
+                      </div>
+                      <small class="pi-import-row__path">{meta.project_path}</small>
+                      <p class="pi-import-row__preview">{piImportPreview(meta)}</p>
+                      <div class="pi-import-row__meta">
+                        <span>{meta.message_count} msg{meta.message_count === 1 ? '' : 's'}</span>
+                        {#if meta.model_id}<span>{meta.model_id}</span>{/if}
+                        {#if meta.provider}<span>{meta.provider}</span>{/if}
+                      </div>
+                    </button>
+                  {/each}
+                </div>
+              {:else if piImportsLoaded && sessions.length === 0}
+                <p class="empty-note">No pi conversations found in <code>~/.pi/agent/sessions/</code>.</p>
+              {:else if !piImportsLoaded}
+                <p class="empty-note">Scanning pi sessions…</p>
+              {/if}
             </section>
           </div>
 
