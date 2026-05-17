@@ -21,6 +21,10 @@ If your goal is “change behavior quickly without breaking integration,” star
   - Centralized Tauri invoke wrappers for pi-related commands
 - `src/lib/services/piEvents.ts`
   - Centralized attachment of `pi://...` listeners
+- `src/lib/components/ChatPane.svelte`
+  - Extracted chat transcript, model chooser, slash menu, composer, status/widget rendering
+- `src/lib/components/HomePane.svelte`
+  - Extracted home launch/import/metrics pane
 - `src/lib/components/ExtensionRequestDialog.svelte`
   - Extracted extension-request modal UI component
 - `src/styles.css`
@@ -33,7 +37,9 @@ If your goal is “change behavior quickly without breaking integration,” star
 ## Backend (runtime + IPC)
 
 - `src-tauri/src/lib.rs`
-  - Runtime composition root + command/event orchestration
+  - Runtime composition root, pi process/RPC orchestration, Tauri bootstrap
+- `src-tauri/src/commands.rs`
++  - Tauri command handlers (`create_session`, `send_message`, model/session/import commands, etc.)
 - `src-tauri/src/state.rs`
   - Core backend state and shared backend models (`SessionStore`, `PiSession`, event payload structs)
 - `src-tauri/src/persistence.rs`

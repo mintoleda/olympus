@@ -13,18 +13,18 @@
 <section class="global-dialog panel" aria-label="Pi request">
   <div class="panel-head">
     <span>{extensionRequest.request.title ?? extensionRequest.request.method}</span>
-    <button on:click={() => onRespond({ cancelled: true })}>Cancel</button>
+    <button onclick={() => onRespond({ cancelled: true })}>Cancel</button>
   </div>
   {#if extensionRequest.request.method === 'confirm'}
     <p>{extensionRequest.request.message}</p>
     <div class="dialog-actions">
-      <button on:click={() => onRespond({ confirmed: false })}>No</button>
-      <button class="primary-action" on:click={() => onRespond({ confirmed: true })}>Yes</button>
+      <button onclick={() => onRespond({ confirmed: false })}>No</button>
+      <button class="primary-action" onclick={() => onRespond({ confirmed: true })}>Yes</button>
     </div>
   {:else if extensionRequest.request.method === 'select'}
     <div class="choice-grid compact">
       {#each extensionRequest.request.options ?? [] as option}
-        <button on:click={() => onRespond({ value: option.value ?? option.id ?? option })}
+        <button onclick={() => onRespond({ value: option.value ?? option.id ?? option })}
           ><strong>{option.label ?? option.name ?? option.value ?? option}</strong></button
         >
       {/each}
@@ -33,7 +33,7 @@
     <input
       class="model-search"
       placeholder={extensionRequest.request.placeholder ?? ''}
-      on:keydown={(event) =>
+      onkeydown={(event) =>
         event.key === 'Enter' && onRespond({ value: (event.currentTarget as HTMLInputElement).value })}
     />
   {:else}
