@@ -83,6 +83,7 @@ const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("compact", "Compact session context"),
     ("name", "Set session display name"),
     ("session", "Show session info"),
+    ("stop", "Stop active Pi runtime and mark idle"),
     ("login", "Configure provider authentication"),
     ("logout", "Remove provider authentication"),
     ("quit", "Exit pi"),
@@ -750,6 +751,7 @@ fn spawn_pi_inner(
                                 timestamp: now_ms(),
                             },
                         );
+                        mark_status(&reader_app, &reader_session_id, "idle");
                     }
                 }
                 Some("extension_ui_request") => {
@@ -938,7 +940,17 @@ fn list_sessions(app: AppHandle, store: State<'_, SessionStore>) -> Result<Vec<P
             .cmp(&b.project_path)
             .then(a.name.cmp(&b.name))
     });
+    let running_session_ids = store
+        .runtimes
+        .lock()
+        .map_err(|_| "runtime store poisoned")?
+        .keys()
+        .cloned()
+        .collect::<std::collections::HashSet<_>>();
     for session in &mut sessions {
+        if session.status == "streaming" && !running_session_ids.contains(&session.id) {
+            session.status = "idle".into();
+        }
         if session.status != "streaming"
             && session.status != "starting"
             && session.status != "error"
@@ -1189,6 +1201,23 @@ fn rename_pi_session(id: String, name: String, app: AppHandle) -> Result<(), Str
 }
 
 #[tauri::command]
+fn stop_session(id: String, app: AppHandle, store: State<'_, SessionStore>) -> Result<(), String> {
+    if let Some(runtime) = store
+        .runtimes
+        .lock()
+        .map_err(|_| "runtime store poisoned")?
+        .remove(&id)
+    {
+        if let Ok(mut child) = runtime.child.lock() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+    mark_status(&app, &id, "idle");
+    Ok(())
+}
+
+#[tauri::command]
 fn close_session(id: String, app: AppHandle, store: State<'_, SessionStore>) -> Result<(), String> {
     if let Some(runtime) = store
         .runtimes
@@ -1244,12 +1273,21 @@ fn send_message(
     }
     emit_message(&app, &id, user_message);
 
-    let runtime = spawn_pi(app, id.clone())?;
+    let runtime = match spawn_pi(app.clone(), id.clone()) {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            mark_status(&app, &id, "idle");
+            return Err(err);
+        }
+    };
 
-    write_rpc(
+    if let Err(err) = write_rpc(
         &runtime,
         serde_json::json!({"id": format!("{id}-prompt-{}", now_ms()), "type": "prompt", "message": content}),
-    )?;
+    ) {
+        mark_status(&app, &id, "idle");
+        return Err(err);
+    }
     Ok(())
 }
 
@@ -1284,6 +1322,7 @@ pub fn run() {
             respond_extension_ui,
             compact_session,
             rename_pi_session,
+            stop_session,
             close_session,
             send_message,
             send_pi_command

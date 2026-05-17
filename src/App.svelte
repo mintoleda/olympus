@@ -387,6 +387,9 @@
           }]
         } : session);
         return true;
+      case 'stop':
+        if (activeSession) await runAction(() => invoke('stop_session', { id: activeSession!.id }));
+        return true;
       case 'resume':
       case 'tree':
         sessionsCollapsed = false;
