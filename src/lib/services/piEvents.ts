@@ -6,6 +6,8 @@ import type {
   SessionEvent,
   SessionUpdateEvent,
   StatusEvent,
+  TitleEvent,
+  SessionClosedEvent,
   WidgetEvent
 } from '../types/pi';
 
@@ -17,6 +19,8 @@ export type PiEventHandlers = {
   onWidget: (event: WidgetEvent) => void;
   onNotify: (event: NotifyEvent) => void;
   onEditorText: (event: EditorTextEvent) => void;
+  onTitle: (event: TitleEvent) => void;
+  onSessionClosed: (event: SessionClosedEvent) => void;
 };
 
 export async function attachPiEventListeners(handlers: PiEventHandlers): Promise<Array<() => void>> {
@@ -48,6 +52,14 @@ export async function attachPiEventListeners(handlers: PiEventHandlers): Promise
     handlers.onEditorText(event.payload);
   });
 
+  const titleCleanup = await listen<TitleEvent>('pi://title', (event) => {
+    handlers.onTitle(event.payload);
+  });
+
+  const sessionClosedCleanup = await listen<SessionClosedEvent>('pi://session-closed', (event) => {
+    handlers.onSessionClosed(event.payload);
+  });
+
   return [
     messageCleanup,
     sessionCleanup,
@@ -55,6 +67,8 @@ export async function attachPiEventListeners(handlers: PiEventHandlers): Promise
     statusCleanup,
     widgetCleanup,
     notifyCleanup,
-    editorTextCleanup
+    editorTextCleanup,
+    titleCleanup,
+    sessionClosedCleanup
   ];
 }

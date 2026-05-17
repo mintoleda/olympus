@@ -1,11 +1,22 @@
 export type PaneId = 'home' | 'chat' | 'search' | 'settings';
 
+export type ContentPart =
+  | { type: 'text'; text: string }
+  | { type: 'thinking'; text: string }
+  | { type: 'tool_use'; id: string; name: string; input: unknown }
+  | { type: 'tool_result'; tool_use_id: string; content: unknown; is_error?: boolean }
+  | { type: 'custom'; customType: string; details: unknown };
+
 export type ChatMessage = {
   id: string;
   role: 'user' | 'assistant' | 'status' | 'system';
   content: string;
   timestamp: number;
   type?: string;
+  content_parts?: ContentPart[];
+  customType?: string;
+  details?: unknown;
+  display?: boolean;
 };
 
 export type PiSession = {
@@ -65,6 +76,10 @@ export type WidgetEvent = { session_id: string; widgets: WidgetEntry[] };
 
 export type NotifyEvent = { session_id: string; message: string; level: string };
 export type EditorTextEvent = { session_id: string; text: string };
+export type TitleEvent = { session_id: string; title: string };
+export type SessionClosedEvent = { session_id: string };
+
+export type StreamingBehavior = 'steer' | 'follow_up' | 'abort' | 'abort_bash' | 'abort_retry';
 
 export type PrimaryPreset = 'plan' | 'build' | 'ask' | 'off';
 export type ConfigChooser = 'provider' | 'model' | 'thinking' | null;

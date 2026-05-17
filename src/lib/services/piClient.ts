@@ -3,7 +3,8 @@ import type {
   PiCommandOption,
   PiModelOption,
   PiSession,
-  PiSessionMeta
+  PiSessionMeta,
+  StreamingBehavior
 } from '../types/pi';
 
 export const piClient = {
@@ -25,8 +26,17 @@ export const piClient = {
   closeSession(id: string) {
     return invoke('close_session', { id });
   },
-  sendMessage(id: string, content: string) {
-    return invoke('send_message', { id, content });
+  sendMessage(id: string, content: string, streamingBehavior?: StreamingBehavior) {
+    return invoke('send_message', { id, content, streamingBehavior: streamingBehavior ?? null });
+  },
+  steerSession(id: string, content: string) {
+    return invoke('send_message', { id, content, streamingBehavior: 'steer' });
+  },
+  followUpSession(id: string, content: string) {
+    return invoke('send_message', { id, content, streamingBehavior: 'follow_up' });
+  },
+  abortSession(id: string, kind: 'abort' | 'abort_bash' | 'abort_retry' = 'abort') {
+    return invoke('send_message', { id, content: '', streamingBehavior: kind });
   },
   sendPiCommand(id: string, content: string) {
     return invoke('send_pi_command', { id, content });

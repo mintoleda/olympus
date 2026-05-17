@@ -290,13 +290,9 @@ pub fn parse_pi_messages(session_file: &str) -> Vec<ChatMessage> {
                     .and_then(parse_iso_ms)
             })
             .unwrap_or(0);
-        messages.push(ChatMessage {
-            id,
-            role,
-            content,
-            timestamp,
-            msg_type: None,
-        });
+        let mut message = ChatMessage::text(id, role.as_str(), content);
+        message.timestamp = timestamp;
+        messages.push(message);
     }
     messages
 }

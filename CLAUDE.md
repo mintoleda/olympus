@@ -4,9 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Olympus is a Tauri 2 desktop app that acts as a hub/wrapper around the external `pi` CLI. The frontend (Svelte 5 + Vite) is purely a renderer; the Rust backend in `src-tauri/` owns one child `pi` process per chat session and bridges its JSON-RPC over stdio into Tauri events that the UI subscribes to.
+Olympus is a Tauri 2 desktop app that acts as a faithful host for the external `pi` CLI. The frontend (Svelte 5 + Vite) is purely a renderer; the Rust backend in `src-tauri/` owns one child `pi` process per chat session and bridges its JSON-RPC over stdio into Tauri events that the UI subscribes to.
 
-Product/architecture intent lives in `docs/` — `PRODUCT_SPEC.md`, `ARCHITECTURE.md`, `SPECS.md`, `IMPLEMENTATION_PLAN.md`. The implementation is currently around Phase 3 (chat sessions work; widgets, search, settings are placeholders).
+**Guiding principle:** Olympus owns presentation, Pi owns semantics. Transcripts, session lifecycle, and slash command meaning all come from Pi. Olympus caches them locally for offline display.
+
+Context for agents lives in `docs/` — read `PI_WORKINGS.md`, `OLYMPUS_SELF_EDITING_GUIDE.md`, and `EXTENSIBILITY_STRATEGY.md`. There is no `ARCHITECTURE.md`/`SPECS.md`/`IMPLEMENTATION_PLAN.md` despite older references.
 
 ## Commands
 
@@ -29,38 +31,65 @@ The `pi` binary must be on `PATH` at runtime — the Rust backend shells out to 
 
 One Tauri app process. For each `PiSession`, the Rust backend spawns a `pi --mode rpc` child (with `--session <id>` when resuming) in the session's `project_path`. stdin/stdout are piped; a per-session reader thread parses newline-delimited JSON events from stdout and forwards them as Tauri events. The frontend never touches `pi` directly.
 
-### Rust backend (`src-tauri/src/lib.rs`)
+### Rust backend (`src-tauri/src/`)
 
-Single file, intentionally. Key pieces:
+Split across a few files:
 
-- `SessionStore` (Tauri-managed state) — holds `sessions: HashMap<id, PiSession>`, `runtimes: HashMap<id, RunningSession>` (live child processes), the active session id, and caches for statuses/widgets/commands.
-- `spawn_pi` / `spawn_pi_inner` — idempotent: returns the existing `RunningSession` if one is already running for that id, otherwise spawns a new `pi` child and starts the reader thread.
+- `lib.rs` — process spawning, reader-loop event dispatch, RPC helpers, app run/exit. The reader loop matches on Pi event types and routes each to a handler.
+- `commands.rs` — every `#[tauri::command]` handler. Add new commands here AND register them in `lib.rs::run()`'s `invoke_handler!` macro.
+- `pi_events.rs` — message emission, status updates, and the canonical message-building helpers (`build_messages_from_pi`, `finalize_message_end`, `replace_session_transcript`).
+- `state.rs` — shared types (`PiSession`, `ChatMessage`, `ContentPart`, `SessionStore`, etc.).
+- `pi_import.rs` — JSONL parsing for imported Pi sessions.
+- `persistence.rs` — `sessions.json` read/write.
+
+Key behaviors:
+
+- `SessionStore` (Tauri-managed state) — holds `sessions: HashMap<id, PiSession>`, `runtimes: HashMap<id, RunningSession>` (live child processes), the active session id, and caches for statuses/widgets/commands/pending-models/pending-commands.
+- `spawn_pi` / `spawn_pi_inner` — idempotent: returns the existing `RunningSession` if one is already running for that id, otherwise spawns a new `pi` child and starts the reader thread. On resume, also issues `get_messages` so Olympus rehydrates from Pi's canonical transcript.
 - Reader thread loop matches on `event.type`:
-  - `agent_start` / `message_update` (with `text_delta` or `thinking_delta`) / `agent_end` → assistant streaming
-  - `response` for `get_state`, `set_model`, `get_commands` → updates the persisted session and emits `pi://session`
-  - `extension_ui_request` with method `select|confirm|input|editor` → forwarded to UI; `setStatus|setWidget|notify|setTitle|set_editor_text` are handled internally and re-emitted as `pi://status` / `pi://widget` / etc.
-- `#[tauri::command]` handlers are the entire IPC surface: `create_session`, `list_sessions`, `switch_session`, `send_message`, `send_pi_command`, `list_pi_models`, `set_pi_model`, `set_pi_thinking_level`, `list_pi_commands`, `respond_extension_ui`, `compact_session`, `rename_pi_session`, `stop_session`, `close_session`. All are registered in `run()` — add new commands there and to the `invoke_handler!` macro.
-- Persistence: sessions are serialised to `<app_data_dir>/sessions.json` on every mutation via `save_sessions`. Runtime state (running children, caches) is not persisted.
+  - `agent_start` → clears stream state and marks streaming.
+  - `message_start` → captures Pi's real message id.
+  - `message_update` (with `text_delta` / `thinking_delta`) → ephemeral display deltas.
+  - `message_update.done` → no-op (message_end is canonical).
+  - **`message_end`** → canonical persistence via `finalize_message_end`. Preserves text/thinking/tool_use/tool_result/custom content parts plus `customType`, `details`, `display`.
+  - `agent_end` → defensive fallback persistence if Pi did not emit `message_end`; otherwise just marks idle.
+  - `response` for `get_state`, `get_messages`, `get_commands`, `list_models`, `set_model` → state mutations and async-channel deliveries to `#[tauri::command]` handlers.
+  - `extension_ui_request` with method `select|confirm|input|editor|custom` → forwarded to UI; `setStatus|setWidget|notify|setTitle|set_editor_text` are handled internally and re-emitted as `pi://status` / `pi://widget` / `pi://title` / etc.
+- Graceful shutdown: `stop_session`, `close_session`, and app-exit all go through `graceful_shutdown(runtime, session_id, timeout)` — send `session_shutdown` RPC, poll `try_wait` for up to 2 s, then `kill()` as fallback. App exit parallelizes shutdowns across all runtimes.
+- Persistence: sessions are serialised to `<app_data_dir>/sessions.json` on every mutation via `save_sessions`. Runtime state (running children, channels, caches) is not persisted. Olympus's `sessions.json` is a *cache* — Pi's session files on disk are the source of truth.
 
 ### Frontend (`src/App.svelte`)
 
 The entire UI is in one `App.svelte` (~950 lines) plus `src/animations.ts` (animejs scopes) and `src/styles.css`. There is no component decomposition yet; reactive `$:` blocks drive everything off `sessions`, `activeSessionId`, and the event-derived `sessionStatuses`/`sessionWidgets` maps.
 
-The UI listens for these Tauri events (set up in `onMount`):
-- `pi://message` — append/stream chat messages (assistant deltas merge into the same message id)
-- `pi://session` — full session snapshot replace
-- `pi://extension-ui-request` — opens a modal that calls back via `respond_extension_ui`
-- `pi://status`, `pi://widget`, `pi://notify`, `pi://editor-text`
+The UI listens for these Tauri events (set up in `onMount` via `attachPiEventListeners`):
+- `pi://message` — append/stream chat messages. Messages with non-empty `content_parts` are canonical (from `message_end`) and *replace* the streamed version; messages without `content_parts` are deltas and *append* to the same id.
+- `pi://session` — full session snapshot replace (sent on state changes, transcript hydration, etc.).
+- `pi://extension-ui-request` — queued in `extensionRequestQueue` (FIFO). The head request drives `ExtensionRequestDialog`.
+- `pi://session-closed` — emitted when a session's reader thread exits; the frontend drops any queued extension requests for that session.
+- `pi://status`, `pi://widget`, `pi://notify`, `pi://editor-text`, `pi://title`.
+
+`ChatMessage` shape (`src/lib/types/pi.ts`) — `content` is a flattened text view kept for back-compat; `content_parts` is a tagged union of `text | thinking | tool_use | tool_result | custom` for rich rendering. Rendering in `ChatPane.svelte` prefers `content_parts` when present.
+
+Custom UI components are registered in `src/lib/components/customUI/registry.ts`. Pi extensions that call `ctx.ui.custom({ component, props })` route to the registered Svelte component; unknown components fall back to a JSON-stringified panel with a Close button.
 
 Panes are `home | chat | search | settings` — only home and chat are real; the other two render placeholder copy.
 
 ### Slash commands
 
-There are two layers and it's easy to confuse them:
-1. **Client-side** (`handleSlashCommand` in `App.svelte`) — UI-only commands like `/model`, `/settings`, `/hotkeys`, `/new`, `/stop`, plus a few that call backend RPCs (`/compact`, `/name`, `/quit`).
-2. **Pi-side** — anything not handled client-side falls through to `send_message`, which forwards to the `pi` child. The `BUILTIN_COMMANDS` table in `lib.rs` is just for the autocomplete menu and is merged with the dynamic command list returned by `pi`'s `get_commands` RPC.
+Two layers, kept deliberately separate so we don't shadow Pi semantics:
 
-When adding a new command, decide which layer it belongs in. Local UI state changes → client side. Anything that changes Pi's session state → let it pass through (or send via `send_pi_command`).
+1. **Olympus-local** (`handleSlashCommand` in `App.svelte`) — commands that change Olympus UI state or call dedicated Olympus RPCs: `/model`, `/scoped-models`, `/settings`, `/hotkeys`, `/new`, `/clear`, `/compact`, `/name`, `/session`, `/stop`, `/quit`. The `BUILTIN_COMMANDS` table in `lib.rs` lists exactly these for autocomplete.
+2. **Pi-side** — *everything else* (`/fork`, `/tree`, `/resume`, `/login`, `/logout`, extension commands, prompt templates) falls through to `send_message`, which forwards to Pi. Autocomplete entries for these come dynamically from Pi's `get_commands` RPC, not from `BUILTIN_COMMANDS`.
+
+When adding a new command:
+- If it changes Olympus UI state or wraps a dedicated Olympus RPC: add to `BUILTIN_COMMANDS` and `handleSlashCommand`.
+- If it changes Pi session state: do not intercept it. Let it pass through and let Pi handle it.
+- Never advertise a command in `BUILTIN_COMMANDS` if Olympus cannot actually execute it correctly — Pi will already advertise its own commands via `get_commands`.
+
+### Streaming behavior
+
+`send_message` accepts an optional `streamingBehavior` ∈ {`steer`, `follow_up`, `abort`, `abort_bash`, `abort_retry`}. When the session is busy and a behavior is provided, the prompt is forwarded with that behavior; without a behavior, busy sessions are rejected. The `ChatPane` swaps the Send button for Steer/Abort buttons while streaming; `abort_bash` is preferred when status starts with `running:` (a tool call in flight).
 
 ## Conventions worth knowing
 

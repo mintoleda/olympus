@@ -9,7 +9,7 @@ use serde_json::Value;
 use tauri::{AppHandle, Manager, State};
 
 use crate::{
-    emit_statuses, emit_widgets, merge_with_builtins, pi_import,
+    emit_statuses, emit_widgets, graceful_shutdown, merge_with_builtins, pi_import,
     persistence::{load_sessions, save_sessions},
     pi_events::{emit_message, emit_session_update, mark_status},
     spawn_pi, spawn_pi_inner, write_rpc,
@@ -39,15 +39,11 @@ pub(crate) fn create_session(
         name: project_name(&project_path),
         project_path,
         status: "starting".into(),
-        messages: vec![ChatMessage {
-            id: format!("session-{id_num}-hello"),
-            role: "assistant".into(),
-            content:
-                "Pi session ready. Olympus will resume this conversation by its Pi session id."
-                    .into(),
-            timestamp: now_ms(),
-            msg_type: None,
-        }],
+        messages: vec![ChatMessage::text(
+            format!("session-{id_num}-hello"),
+            "assistant",
+            "Pi session ready. Olympus will resume this conversation by its Pi session id.",
+        )],
         session_dir: String::new(),
         pi_session_id: None,
         pi_session_file: None,
@@ -157,16 +153,14 @@ pub(crate) fn import_pi_session(
         let fallback = std::env::current_dir()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| meta.project_path.clone());
-        messages.push(ChatMessage {
-            id: format!("session-{id_num}-cwd-warning"),
-            role: "assistant".into(),
-            content: format!(
+        messages.push(ChatMessage::text(
+            format!("session-{id_num}-cwd-warning"),
+            "assistant",
+            format!(
                 "⚠ Original project path `{}` no longer exists; running from `{}`.",
                 meta.project_path, fallback
             ),
-            timestamp: now_ms(),
-            msg_type: None,
-        });
+        ));
         fallback
     };
 
@@ -303,21 +297,7 @@ pub(crate) fn send_pi_command(id: String, content: String, app: AppHandle) -> Re
     )
 }
 
-#[tauri::command]
-pub(crate) fn list_pi_models(
-    id: String,
-    store: State<'_, SessionStore>,
-) -> Result<Vec<PiModelOption>, String> {
-    let project_path = {
-        let sessions = store
-            .sessions
-            .lock()
-            .map_err(|_| "session store poisoned")?;
-        sessions
-            .get(&id)
-            .map(|session| session.project_path.clone())
-    };
-
+fn list_models_via_cli(project_path: Option<String>) -> Result<Vec<PiModelOption>, String> {
     let mut command = Command::new("pi");
     command
         .arg("--list-models")
@@ -355,6 +335,69 @@ pub(crate) fn list_pi_models(
         return Err("Pi returned no available models".into());
     }
     Ok(models)
+}
+
+#[tauri::command]
+pub(crate) fn list_pi_models(
+    id: String,
+    app: AppHandle,
+) -> Result<Vec<PiModelOption>, String> {
+    let runtime = spawn_pi_inner(app.clone(), id.clone(), false)?;
+    let request_id = format!("{id}-models-{}", now_ms());
+
+    let (tx, rx) = sync_channel::<Vec<PiModelOption>>(1);
+    {
+        let store = app.state::<SessionStore>();
+        let mut pending = store
+            .pending_models
+            .lock()
+            .map_err(|_| "pending models lock poisoned")?;
+        pending.insert(request_id.clone(), tx);
+    }
+
+    let write_result = write_rpc(
+        &runtime,
+        serde_json::json!({"id": request_id, "type": "list_models"}),
+    );
+
+    if let Err(_) = write_result {
+        let store = app.state::<SessionStore>();
+        if let Ok(mut pending) = store.pending_models.lock() {
+            pending.remove(&request_id);
+        }
+        // RPC channel broken — fall through to CLI.
+        let project_path = {
+            let store = app.state::<SessionStore>();
+            let sessions = store
+                .sessions
+                .lock()
+                .map_err(|_| "session store poisoned")?;
+            sessions
+                .get(&id)
+                .map(|session| session.project_path.clone())
+        };
+        return list_models_via_cli(project_path);
+    }
+
+    match rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(models) if !models.is_empty() => Ok(models),
+        _ => {
+            let store = app.state::<SessionStore>();
+            if let Ok(mut pending) = store.pending_models.lock() {
+                pending.remove(&request_id);
+            }
+            let project_path = {
+                let sessions = store
+                    .sessions
+                    .lock()
+                    .map_err(|_| "session store poisoned")?;
+                sessions
+                    .get(&id)
+                    .map(|session| session.project_path.clone())
+            };
+            list_models_via_cli(project_path)
+        }
+    }
 }
 
 #[tauri::command]
@@ -501,10 +544,7 @@ pub(crate) fn stop_session(id: String, app: AppHandle, store: State<'_, SessionS
         .map_err(|_| "runtime store poisoned")?
         .remove(&id)
     {
-        if let Ok(mut child) = runtime.child.lock() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        graceful_shutdown(&runtime, &id, Duration::from_secs(2));
     }
     mark_status(&app, &id, "idle");
     Ok(())
@@ -518,10 +558,7 @@ pub(crate) fn close_session(id: String, app: AppHandle, store: State<'_, Session
         .map_err(|_| "runtime store poisoned")?
         .remove(&id)
     {
-        if let Ok(mut child) = runtime.child.lock() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        graceful_shutdown(&runtime, &id, Duration::from_secs(2));
     }
     if let Ok(mut sessions) = store.sessions.lock() {
         sessions.remove(&id);
@@ -541,16 +578,22 @@ pub(crate) fn close_session(id: String, app: AppHandle, store: State<'_, Session
 pub(crate) fn send_message(
     id: String,
     content: String,
+    streaming_behavior: Option<String>,
     app: AppHandle,
     store: State<'_, SessionStore>,
 ) -> Result<(), String> {
-    let user_message = ChatMessage {
-        id: format!("{id}-u-{}", now_ms()),
-        role: "user".into(),
-        content: content.clone(),
-        timestamp: now_ms(),
-        msg_type: None,
-    };
+    let trimmed_behavior = streaming_behavior
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let user_message = ChatMessage::text(
+        format!("{id}-u-{}", now_ms()),
+        "user",
+        content.clone(),
+    );
+
+    let push_user_message = !content.trim().is_empty();
 
     {
         let mut sessions = store
@@ -558,21 +601,25 @@ pub(crate) fn send_message(
             .lock()
             .map_err(|_| "session store poisoned")?;
         let session = sessions.get_mut(&id).ok_or("session not found")?;
-        if session.status == "streaming" || session.status == "waiting" {
+        let busy = session.status == "streaming" || session.status == "waiting";
+        if busy && trimmed_behavior.is_none() {
             return Err("session is already streaming".into());
         }
-        session.messages.push(user_message.clone());
-        // Slash commands that are session-control ops won't emit agent_start/agent_end,
-        // so don't pre-set "streaming" — let agent_start set it. Use "waiting" so
-        // the reader thread's new_session/idle responses can clear it without getting stuck.
-        session.status = if content.trim_start().starts_with('/') {
-            "waiting".into()
-        } else {
-            "streaming".into()
-        };
+        if push_user_message {
+            session.messages.push(user_message.clone());
+        }
+        if !busy {
+            session.status = if content.trim_start().starts_with('/') {
+                "waiting".into()
+            } else {
+                "streaming".into()
+            };
+        }
         save_sessions(&app, &sessions)?;
     }
-    emit_message(&app, &id, user_message);
+    if push_user_message {
+        emit_message(&app, &id, user_message);
+    }
 
     let runtime = match spawn_pi(app.clone(), id.clone()) {
         Ok(runtime) => runtime,
@@ -582,10 +629,21 @@ pub(crate) fn send_message(
         }
     };
 
-    if let Err(err) = write_rpc(
-        &runtime,
-        serde_json::json!({"id": format!("{id}-prompt-{}", now_ms()), "type": "prompt", "message": content}),
-    ) {
+    let mut payload = serde_json::json!({
+        "id": format!("{id}-prompt-{}", now_ms()),
+        "type": "prompt",
+        "message": content,
+    });
+    if let Some(behavior) = trimmed_behavior {
+        if let Some(object) = payload.as_object_mut() {
+            object.insert(
+                "streamingBehavior".into(),
+                Value::String(behavior.to_string()),
+            );
+        }
+    }
+
+    if let Err(err) = write_rpc(&runtime, payload) {
         mark_status(&app, &id, "idle");
         return Err(err);
     }

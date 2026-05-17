@@ -12,6 +12,32 @@ use std::{
 };
 
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(crate) enum ContentPart {
+    Text { text: String },
+    Thinking { text: String },
+    ToolUse {
+        id: String,
+        name: String,
+        #[serde(default)]
+        input: Value,
+    },
+    ToolResult {
+        tool_use_id: String,
+        #[serde(default)]
+        content: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        is_error: Option<bool>,
+    },
+    Custom {
+        #[serde(rename = "customType")]
+        custom_type: String,
+        #[serde(default)]
+        details: Value,
+    },
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub(crate) struct ChatMessage {
     pub(crate) id: String,
     pub(crate) role: String,
@@ -19,6 +45,45 @@ pub(crate) struct ChatMessage {
     pub(crate) timestamp: u64,
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     pub(crate) msg_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) content_parts: Vec<ContentPart>,
+    #[serde(
+        default,
+        rename = "customType",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) custom_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) details: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) display: Option<bool>,
+}
+
+impl ChatMessage {
+    pub(crate) fn text(id: impl Into<String>, role: &str, content: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            role: role.into(),
+            content: content.into(),
+            timestamp: now_ms(),
+            msg_type: None,
+            content_parts: Vec::new(),
+            custom_type: None,
+            details: None,
+            display: None,
+        }
+    }
+
+    pub(crate) fn typed(
+        id: impl Into<String>,
+        role: &str,
+        content: impl Into<String>,
+        msg_type: &str,
+    ) -> Self {
+        let mut msg = Self::text(id, role, content);
+        msg.msg_type = Some(msg_type.into());
+        msg
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -48,7 +113,7 @@ pub(crate) struct SessionUpdateEvent {
     pub(crate) session: PiSession,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Default, Serialize)]
 pub(crate) struct PiModelOption {
     pub(crate) provider: String,
     pub(crate) id: String,
@@ -133,6 +198,7 @@ pub(crate) struct SessionStore {
     pub(crate) counter: AtomicU64,
     pub(crate) pending_commands: Mutex<HashMap<String, SyncSender<Vec<PiCommandOption>>>>,
     pub(crate) last_commands: Mutex<HashMap<String, Vec<PiCommandOption>>>,
+    pub(crate) pending_models: Mutex<HashMap<String, SyncSender<Vec<PiModelOption>>>>,
     pub(crate) session_statuses: Mutex<HashMap<String, Vec<StatusEntry>>>,
     pub(crate) session_widgets: Mutex<HashMap<String, Vec<WidgetEntry>>>,
 }

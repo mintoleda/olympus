@@ -7,13 +7,14 @@ mod state;
 use persistence::{load_sessions, persist_store, save_sessions};
 use pi_events::{
     append_assistant_delta, append_thinking_delta, emit_message, emit_session_update,
-    finalize_assistant, finalize_thinking, mark_status,
+    finalize_assistant, finalize_message_end, finalize_thinking, mark_status,
+    replace_session_transcript,
 };
 use serde_json::Value;
 use state::{
     now_ms, ChatMessage, EditorTextEvent, ExtensionUiRequest, NotifyEvent, PiCommandOption,
-    PiSession, RunningSession, SessionStore, StatusEntry, StatusEvent, TitleEvent, WidgetEntry,
-    WidgetEvent,
+    PiModelOption, PiSession, RunningSession, SessionStore, StatusEntry, StatusEvent, TitleEvent,
+    WidgetEntry, WidgetEvent,
 };
 use std::{
     io::{BufRead, BufReader, Write},
@@ -23,21 +24,22 @@ use std::{
 };
 use tauri::{AppHandle, Emitter, Manager};
 
+/// Olympus-local slash commands. Each is handled entirely in the frontend
+/// by `handleSlashCommand` in `App.svelte` — they never reach Pi.
+/// Pi-side commands (`/fork`, `/tree`, `/resume`, `/login`, `/logout`, …)
+/// are populated dynamically via `get_commands` and forwarded to Pi as prompts.
 const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("model", "Switch model"),
     ("scoped-models", "Enable/disable models for cycling"),
-    ("settings", "Open settings"),
+    ("settings", "Open Olympus settings"),
     ("hotkeys", "Show keyboard shortcuts"),
-    ("new", "Start a new session"),
-    ("resume", "Resume a session"),
-    ("tree", "Navigate session tree"),
+    ("new", "Start a new Olympus session"),
+    ("clear", "Reset the current Pi session"),
     ("compact", "Compact session context"),
-    ("name", "Set session display name"),
-    ("session", "Show session info"),
+    ("name", "Set Olympus session display name"),
+    ("session", "Show Olympus session info"),
     ("stop", "Stop active Pi runtime and mark idle"),
-    ("login", "Configure provider authentication"),
-    ("logout", "Remove provider authentication"),
-    ("quit", "Exit pi"),
+    ("quit", "Close the current Olympus session"),
 ];
 
 fn value_string(value: Option<&Value>) -> Option<String> {
@@ -170,6 +172,83 @@ fn handle_commands_response(app: &AppHandle, session_id: &str, event: &Value) {
     }
 }
 
+fn parse_models(event: &Value) -> Vec<PiModelOption> {
+    let items = event
+        .pointer("/data/models")
+        .or_else(|| event.pointer("/data"))
+        .and_then(Value::as_array);
+    let Some(items) = items else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            let provider = item
+                .get("provider")
+                .and_then(Value::as_str)?
+                .to_string();
+            let id = item
+                .get("id")
+                .or_else(|| item.get("modelId"))
+                .or_else(|| item.get("name"))
+                .and_then(Value::as_str)?
+                .to_string();
+            let context = item
+                .get("context")
+                .or_else(|| item.get("contextWindow"))
+                .map(|v| {
+                    v.as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| v.to_string())
+                })
+                .unwrap_or_default();
+            let max_output = item
+                .get("maxOutput")
+                .or_else(|| item.get("max_output"))
+                .map(|v| {
+                    v.as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| v.to_string())
+                })
+                .unwrap_or_default();
+            let reasoning = item
+                .get("reasoning")
+                .or_else(|| item.get("supportsThinking"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let images = item
+                .get("images")
+                .or_else(|| item.get("supportsImages"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            Some(PiModelOption {
+                provider,
+                id,
+                context,
+                max_output,
+                reasoning,
+                images,
+            })
+        })
+        .collect()
+}
+
+fn handle_models_response(app: &AppHandle, event: &Value) {
+    let models = parse_models(event);
+    let request_id = event.get("id").and_then(Value::as_str).map(str::to_string);
+    if let Some(request_id) = request_id {
+        let store = app.state::<SessionStore>();
+        let sender = store
+            .pending_models
+            .lock()
+            .ok()
+            .and_then(|mut map| map.remove(&request_id));
+        if let Some(sender) = sender {
+            let _ = sender.try_send(models);
+        }
+    }
+}
+
 pub(crate) fn merge_with_builtins(commands: Vec<PiCommandOption>) -> Vec<PiCommandOption> {
     let mut merged: Vec<PiCommandOption> = BUILTIN_COMMANDS
         .iter()
@@ -235,13 +314,12 @@ fn handle_set_status(app: &AppHandle, session_id: &str, event: &Value) {
                 emit_message(
                     app,
                     session_id,
-                    ChatMessage {
-                        id: format!("{session_id}-tool-{key}-{}", now_ms()),
-                        role: "assistant".into(),
-                        content: format!("{key}: {text}"),
-                        timestamp: now_ms(),
-                        msg_type: Some("tool".into()),
-                    },
+                    ChatMessage::typed(
+                        format!("{session_id}-tool-{key}-{}", now_ms()),
+                        "assistant",
+                        format!("{key}: {text}"),
+                        "tool",
+                    ),
                 );
             }
             entries.push(StatusEntry { key, text: text.clone() });
@@ -392,6 +470,40 @@ pub(crate) fn write_rpc(runtime: &RunningSession, request: Value) -> Result<(), 
     stdin.flush().map_err(|err| err.to_string())
 }
 
+/// Send `session_shutdown` and give Pi a bounded window to flush extension
+/// hooks before SIGKILLing. Returns once the child has exited (cleanly or via kill).
+pub(crate) fn graceful_shutdown(
+    runtime: &RunningSession,
+    session_id: &str,
+    timeout: std::time::Duration,
+) {
+    let _ = write_rpc(
+        runtime,
+        serde_json::json!({
+            "id": format!("{session_id}-shutdown-{}", now_ms()),
+            "type": "session_shutdown",
+        }),
+    );
+
+    let deadline = std::time::Instant::now() + timeout;
+    if let Ok(mut child) = runtime.child.lock() {
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => {
+                    if std::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
 fn write_get_state_via_stdin(stdin: &Arc<Mutex<ChildStdin>>, session_id: &str) {
     if let Ok(mut guard) = stdin.lock() {
         let msg = serde_json::json!({"id": format!("{session_id}-state-{}", now_ms()), "type": "get_state"});
@@ -404,6 +516,13 @@ fn request_pi_state(runtime: &RunningSession, session_id: &str) -> Result<(), St
     write_rpc(
         runtime,
         serde_json::json!({"id": format!("{session_id}-state-{}", now_ms()), "type": "get_state"}),
+    )
+}
+
+fn request_pi_messages(runtime: &RunningSession, session_id: &str) -> Result<(), String> {
+    write_rpc(
+        runtime,
+        serde_json::json!({"id": format!("{session_id}-msgs-{}", now_ms()), "type": "get_messages"}),
     )
 }
 
@@ -483,6 +602,7 @@ pub(crate) fn spawn_pi_inner(
         let mut full_response = String::new();
         let mut current_thinking_id = String::new();
         let mut thinking_response = String::new();
+        let mut message_persisted = false;
         let reader = BufReader::new(stdout);
 
         for line in reader.lines().map_while(Result::ok) {
@@ -499,6 +619,19 @@ pub(crate) fn spawn_pi_inner(
                                 handle_state_response(&reader_app, &reader_session_id, data);
                             }
                         }
+                        Some("get_messages") if success => {
+                            if let Some(data) = event.get("data") {
+                                let messages = data.get("messages").unwrap_or(data);
+                                replace_session_transcript(
+                                    &reader_app,
+                                    &reader_session_id,
+                                    messages,
+                                );
+                            }
+                        }
+                        Some("get_messages") => {
+                            // Pi doesn't support get_messages — keep cached transcript.
+                        }
                         Some("set_model") if success => {
                             if let Some(data) = event.get("data") {
                                 handle_set_model_response(&reader_app, &reader_session_id, data);
@@ -506,6 +639,22 @@ pub(crate) fn spawn_pi_inner(
                         }
                         Some("get_commands") if success => {
                             handle_commands_response(&reader_app, &reader_session_id, &event);
+                        }
+                        Some("list_models") if success => {
+                            handle_models_response(&reader_app, &event);
+                        }
+                        Some("list_models") => {
+                            // Pi doesn't support list_models RPC — drop the pending sender so
+                            // the caller can fall back to the CLI parser.
+                            if let Some(request_id) =
+                                event.get("id").and_then(Value::as_str).map(str::to_string)
+                            {
+                                let store = reader_app.state::<SessionStore>();
+                                if let Ok(mut map) = store.pending_models.lock() {
+                                    map.remove(&request_id);
+                                };
+                                drop(store);
+                            }
                         }
                         Some("new_session") if success => {
                             // Pi created a new session; clean up stream state, add separator, sync state
@@ -516,13 +665,12 @@ pub(crate) fn spawn_pi_inner(
                             emit_message(
                                 &reader_app,
                                 &reader_session_id,
-                                ChatMessage {
-                                    id: format!("{reader_session_id}-reset-{}", now_ms()),
-                                    role: "system".into(),
-                                    content: "── session reset ──".into(),
-                                    timestamp: now_ms(),
-                                    msg_type: Some("separator".into()),
-                                },
+                                ChatMessage::typed(
+                                    format!("{reader_session_id}-reset-{}", now_ms()),
+                                    "system",
+                                    "── session reset ──",
+                                    "separator",
+                                ),
                             );
                             mark_status(&reader_app, &reader_session_id, "idle");
                             write_get_state_via_stdin(&reader_stdin, &reader_session_id);
@@ -539,13 +687,11 @@ pub(crate) fn spawn_pi_inner(
                             emit_message(
                                 &reader_app,
                                 &reader_session_id,
-                                ChatMessage {
-                                    id: format!("{reader_session_id}-err-{}", now_ms()),
-                                    role: "assistant".into(),
-                                    content: text,
-                                    timestamp: now_ms(),
-                                    msg_type: None,
-                                },
+                                ChatMessage::text(
+                                    format!("{reader_session_id}-err-{}", now_ms()),
+                                    "assistant",
+                                    text,
+                                ),
                             );
                             mark_status(&reader_app, &reader_session_id, "idle");
                         }
@@ -558,7 +704,7 @@ pub(crate) fn spawn_pi_inner(
                         .and_then(Value::as_str)
                         .unwrap_or_default();
                     match method {
-                        "select" | "confirm" | "input" | "editor" => {
+                        "select" | "confirm" | "input" | "editor" | "custom" => {
                             let mut request = event.clone();
                             if let Some(object) = request.as_object_mut() {
                                 object.remove("type");
@@ -597,13 +743,11 @@ pub(crate) fn spawn_pi_inner(
                     emit_message(
                         &reader_app,
                         &reader_session_id,
-                        ChatMessage {
-                            id: format!("{reader_session_id}-ext-err-{}", now_ms()),
-                            role: "assistant".into(),
-                            content: format!("Extension error: {msg}"),
-                            timestamp: now_ms(),
-                            msg_type: None,
-                        },
+                        ChatMessage::text(
+                            format!("{reader_session_id}-ext-err-{}", now_ms()),
+                            "assistant",
+                            format!("Extension error: {msg}"),
+                        ),
                     );
                     mark_status(&reader_app, &reader_session_id, "idle");
                 }
@@ -634,11 +778,24 @@ pub(crate) fn spawn_pi_inner(
                     mark_status(&reader_app, &reader_session_id, "streaming");
                 }
                 Some("agent_start") => {
-                    current_message_id = format!("{reader_session_id}-a-{}", now_ms());
+                    current_message_id.clear();
                     full_response.clear();
                     current_thinking_id.clear();
                     thinking_response.clear();
+                    message_persisted = false;
                     mark_status(&reader_app, &reader_session_id, "streaming");
+                }
+                Some("message_start") => {
+                    let pi_id = event
+                        .pointer("/message/id")
+                        .and_then(Value::as_str)
+                        .or_else(|| event.get("messageId").and_then(Value::as_str))
+                        .or_else(|| event.get("id").and_then(Value::as_str))
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("{reader_session_id}-a-{}", now_ms()));
+                    current_message_id = pi_id;
+                    full_response.clear();
+                    message_persisted = false;
                 }
                 Some("message_update") => {
                     let delta_event = &event["assistantMessageEvent"];
@@ -691,17 +848,8 @@ pub(crate) fn spawn_pi_inner(
                             }
                         }
                         Some("done") => {
-                            // Message-level stream finished cleanly (pi may still emit agent_end)
-                            if !current_message_id.is_empty() {
-                                finalize_assistant(
-                                    &reader_app,
-                                    &reader_session_id,
-                                    &current_message_id,
-                                    full_response.clone(),
-                                );
-                                current_message_id.clear();
-                                full_response.clear();
-                            }
+                            // Streaming for this message is done; message_end will persist.
+                            // No-op here to avoid double-finalize.
                         }
                         Some("error") => {
                             let msg = delta_event
@@ -711,13 +859,11 @@ pub(crate) fn spawn_pi_inner(
                             emit_message(
                                 &reader_app,
                                 &reader_session_id,
-                                ChatMessage {
-                                    id: format!("{reader_session_id}-serr-{}", now_ms()),
-                                    role: "assistant".into(),
-                                    content: format!("Stream error: {msg}"),
-                                    timestamp: now_ms(),
-                                    msg_type: None,
-                                },
+                                ChatMessage::text(
+                                    format!("{reader_session_id}-serr-{}", now_ms()),
+                                    "assistant",
+                                    format!("Stream error: {msg}"),
+                                ),
                             );
                             current_message_id.clear();
                             full_response.clear();
@@ -726,28 +872,49 @@ pub(crate) fn spawn_pi_inner(
                         _ => {}
                     }
                 }
-                Some("agent_end") => {
-                    if !current_thinking_id.is_empty() {
-                        finalize_thinking(
+                Some("message_end" | "message_stop") => {
+                    if let Some(message) = event.get("message") {
+                        finalize_message_end(
                             &reader_app,
                             &reader_session_id,
+                            message,
+                            &current_message_id,
                             &current_thinking_id,
-                            thinking_response.clone(),
+                            &thinking_response,
                         );
+                        message_persisted = true;
+                        current_message_id.clear();
+                        full_response.clear();
                         current_thinking_id.clear();
                         thinking_response.clear();
                     }
-                    if current_message_id.is_empty() {
-                        current_message_id = format!("{reader_session_id}-a-{}", now_ms());
+                }
+                Some("agent_end") => {
+                    // Fallback path: Pi did not emit message_end. Persist what we streamed.
+                    if !message_persisted {
+                        if !current_thinking_id.is_empty() {
+                            finalize_thinking(
+                                &reader_app,
+                                &reader_session_id,
+                                &current_thinking_id,
+                                thinking_response.clone(),
+                            );
+                        }
+                        if !current_message_id.is_empty() && !full_response.trim().is_empty() {
+                            finalize_assistant(
+                                &reader_app,
+                                &reader_session_id,
+                                &current_message_id,
+                                full_response.clone(),
+                            );
+                        }
                     }
-                    finalize_assistant(
-                        &reader_app,
-                        &reader_session_id,
-                        &current_message_id,
-                        full_response.clone(),
-                    );
                     current_message_id.clear();
                     full_response.clear();
+                    current_thinking_id.clear();
+                    thinking_response.clear();
+                    message_persisted = false;
+                    mark_status(&reader_app, &reader_session_id, "idle");
                 }
                 _ => {}
             }
@@ -757,6 +924,11 @@ pub(crate) fn spawn_pi_inner(
         if let Ok(mut runtimes) = store.runtimes.lock() {
             runtimes.remove(&reader_session_id);
         }
+        drop(store);
+        let _ = reader_app.emit(
+            "pi://session-closed",
+            serde_json::json!({ "session_id": reader_session_id }),
+        );
         mark_status(&reader_app, &reader_session_id, "idle");
     });
 
@@ -775,6 +947,21 @@ pub(crate) fn spawn_pi_inner(
 
     if request_initial_state {
         request_pi_state(&runtime, &session_id)?;
+        // When resuming an existing Pi session, ask Pi for the canonical transcript
+        // and replace Olympus's cached messages. New sessions skip this — Pi has nothing.
+        let is_resume = {
+            let sessions = store
+                .sessions
+                .lock()
+                .map_err(|_| "session store poisoned")?;
+            sessions
+                .get(&session_id)
+                .map(|s| s.pi_session_file.is_some() || s.pi_session_id.is_some())
+                .unwrap_or(false)
+        };
+        if is_resume {
+            request_pi_messages(&runtime, &session_id)?;
+        }
     }
 
     Ok(runtime)
@@ -783,15 +970,20 @@ pub(crate) fn spawn_pi_inner(
 
 fn shutdown_all_runtimes(app: &AppHandle) {
     let store = app.state::<SessionStore>();
-    let runtimes: Vec<RunningSession> = match store.runtimes.lock() {
-        Ok(mut map) => map.drain().map(|(_, runtime)| runtime).collect(),
+    let entries: Vec<(String, RunningSession)> = match store.runtimes.lock() {
+        Ok(mut map) => map.drain().collect(),
         Err(_) => return,
     };
-    for runtime in runtimes {
-        if let Ok(mut child) = runtime.child.lock() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+
+    let timeout = std::time::Duration::from_secs(2);
+    let mut handles = Vec::with_capacity(entries.len());
+    for (session_id, runtime) in entries {
+        handles.push(thread::spawn(move || {
+            graceful_shutdown(&runtime, &session_id, timeout);
+        }));
+    }
+    for handle in handles {
+        let _ = handle.join();
     }
 }
 

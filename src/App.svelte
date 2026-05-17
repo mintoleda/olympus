@@ -53,7 +53,7 @@
   let commandOptions: PiCommandOption[] = [];
   let commandCache = new Map<string, PiCommandOption[]>();
   let commandFetchInFlight = '';
-  let extensionRequest: ExtensionUiRequest | null = null;
+  let extensionRequestQueue: ExtensionUiRequest[] = [];
   let sessionStatuses = new Map<string, StatusEntry[]>();
   let sessionWidgets = new Map<string, WidgetEntry[]>();
   let rootEl: HTMLElement;
@@ -119,6 +119,10 @@
   $: filteredModels = activeProviderModels
     .filter((model) => !modelSearch || model.id.toLowerCase().includes(modelSearch))
     .slice(0, 160);
+  $: activeExtensionRequest = extensionRequestQueue[0] ?? null;
+  $: extensionRequestSession = activeExtensionRequest
+    ? sessions.find((s) => s.id === activeExtensionRequest!.session_id)
+    : undefined;
   $: activeStatuses = activeSession ? sessionStatuses.get(activeSession.id) ?? [] : [];
   $: activeWidgets = activeSession ? sessionWidgets.get(activeSession.id) ?? [] : [];
   $: presetStatus = activeStatuses.find((entry) => entry.key === 'opencode-preset' || entry.key === 'preset');
@@ -280,6 +284,17 @@
     if (ok !== undefined) draft = '';
   }
 
+  async function steer() {
+    if (!activeSession || !draft.trim()) return;
+    const ok = await runAction(() => piClient.steerSession(activeSession!.id, draft));
+    if (ok !== undefined) draft = '';
+  }
+
+  async function abort(kind: 'abort' | 'abort_bash' = 'abort') {
+    if (!activeSession) return;
+    await runAction(() => piClient.abortSession(activeSession!.id, kind));
+  }
+
   function clampZoom(value: number) {
     return Math.min(1.4, Math.max(0.75, Math.round(value * 100) / 100));
   }
@@ -358,9 +373,6 @@
       case 'clear':
         if (activeSession) await runAction(() => piClient.resetPiSession(activeSession!.id));
         return true;
-      case 'fork':
-        await createSession(activeSession?.project_path);
-        return true;
       case 'compact':
         await runAction(() => piClient.compactSession(activeSession!.id, args || null));
         return true;
@@ -380,10 +392,6 @@
         return true;
       case 'stop':
         if (activeSession) await runAction(() => piClient.stopSession(activeSession!.id));
-        return true;
-      case 'resume':
-      case 'tree':
-        sessionsCollapsed = false;
         return true;
       case 'quit':
         if (activeSession) await closeSession(activeSession.id);
@@ -431,11 +439,12 @@
   }
 
   async function respondToExtensionRequest(response: Record<string, any>) {
-    if (!extensionRequest) return;
+    const current = extensionRequestQueue[0];
+    if (!current) return;
     await runAction(() =>
-      piClient.respondExtensionUi(extensionRequest!.session_id, extensionRequest!.request.id, response)
+      piClient.respondExtensionUi(current.session_id, current.request.id, response)
     );
-    extensionRequest = null;
+    extensionRequestQueue = extensionRequestQueue.slice(1);
   }
 
   async function ensureModelOptions() {
@@ -531,21 +540,28 @@
             sessions = sessions.map((session) => {
               if (session.id !== session_id) return session;
               if (message.role === 'status') return { ...session, status: message.content || 'idle' };
-              if (message.role === 'assistant') {
-                const existing = session.messages.find((item) => item.id === message.id);
-                if (existing) {
+              const isCanonical = Array.isArray(message.content_parts) && message.content_parts.length > 0;
+              const existing = session.messages.find((item) => item.id === message.id);
+              if (existing) {
+                if (isCanonical) {
                   return {
                     ...session,
-                    status: 'streaming',
                     messages: session.messages.map((item) =>
-                      item.id === message.id ? { ...item, content: item.content + message.content } : item
+                      item.id === message.id ? message : item
                     )
                   };
                 }
+                return {
+                  ...session,
+                  status: message.role === 'assistant' ? 'streaming' : session.status,
+                  messages: session.messages.map((item) =>
+                    item.id === message.id ? { ...item, content: item.content + message.content } : item
+                  )
+                };
               }
               return {
                 ...session,
-                status: message.role === 'assistant' ? 'streaming' : session.status,
+                status: message.role === 'assistant' && !isCanonical ? 'streaming' : session.status,
                 messages: [...session.messages, message]
               };
             });
@@ -557,7 +573,7 @@
             if (!activeSessionId) activeSessionId = updated.id;
           },
           onExtensionRequest: (payload) => {
-            extensionRequest = payload;
+            extensionRequestQueue = [...extensionRequestQueue, payload];
           },
           onStatus: ({ session_id, statuses }) => {
             const next = new Map(sessionStatuses);
@@ -591,6 +607,16 @@
             if (activeSession && session_id === activeSession.id) {
               draft = text;
             }
+          },
+          onTitle: ({ session_id, title }) => {
+            sessions = sessions.map((session) =>
+              session.id === session_id ? { ...session, name: title || session.name } : session
+            );
+          },
+          onSessionClosed: ({ session_id }) => {
+            extensionRequestQueue = extensionRequestQueue.filter(
+              (req) => req.session_id !== session_id
+            );
           }
         });
 
@@ -707,6 +733,8 @@
             onRefreshCommandOptions={refreshCommandOptions}
             onEnsureCommandOptions={ensureCommandOptions}
             onSend={send}
+            onSteer={steer}
+            onAbort={abort}
           />
 
         {:else if activePane === 'chat'}
@@ -809,8 +837,13 @@
     </section>
   {/if}
 
-  {#if extensionRequest}
-    <ExtensionRequestDialog extensionRequest={extensionRequest} onRespond={respondToExtensionRequest} />
+  {#if activeExtensionRequest}
+    <ExtensionRequestDialog
+      extensionRequest={activeExtensionRequest}
+      sessionLabel={extensionRequestSession?.name ?? activeExtensionRequest.session_id}
+      pendingCount={extensionRequestQueue.length}
+      onRespond={respondToExtensionRequest}
+    />
   {/if}
 
   <div class="fps-overlay">fps: {fps}</div>
