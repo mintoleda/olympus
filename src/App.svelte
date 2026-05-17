@@ -68,6 +68,8 @@
   let pendingPiImports: PiSessionMeta[] = [];
   let piImportsLoaded = false;
   let piImportBusy = '';
+  let sendInFlight = false;
+  let steerInFlight = false;
 
   function menuClickOutside(node: HTMLElement) {
     const handle = (e: MouseEvent) => {
@@ -273,21 +275,34 @@
   }
 
   async function send() {
-    if (!activeSession || !draft.trim()) return;
-    activePane = 'chat';
-    const content = draft.trim();
-    if (content.startsWith('/') && await handleSlashCommand(content)) {
-      draft = '';
-      return;
+    if (sendInFlight || !activeSession || !draft.trim()) return;
+    sendInFlight = true;
+    try {
+      activePane = 'chat';
+      const sessionId = activeSession.id;
+      const content = draft.trim();
+      if (content.startsWith('/') && await handleSlashCommand(content)) {
+        draft = '';
+        return;
+      }
+      const ok = await runAction(() => piClient.sendMessage(sessionId, content));
+      if (ok !== undefined) draft = '';
+    } finally {
+      sendInFlight = false;
     }
-    const ok = await runAction(() => piClient.sendMessage(activeSession!.id, draft));
-    if (ok !== undefined) draft = '';
   }
 
   async function steer() {
-    if (!activeSession || !draft.trim()) return;
-    const ok = await runAction(() => piClient.steerSession(activeSession!.id, draft));
-    if (ok !== undefined) draft = '';
+    if (steerInFlight || !activeSession || !draft.trim()) return;
+    steerInFlight = true;
+    try {
+      const sessionId = activeSession.id;
+      const content = draft.trim();
+      const ok = await runAction(() => piClient.steerSession(sessionId, content));
+      if (ok !== undefined) draft = '';
+    } finally {
+      steerInFlight = false;
+    }
   }
 
   async function abort(kind: 'abort' | 'abort_bash' = 'abort') {
@@ -718,9 +733,9 @@
             {activeProviderModels}
             {filteredModels}
             {visibleCommands}
-            {nonPresetStatuses}
-            {aboveWidgets}
-            {belowWidgets}
+            nonPresetStatuses={nonPresetStatuses}
+            aboveWidgets={aboveWidgets}
+            belowWidgets={belowWidgets}
             {error}
             bind:chatLogEl
             bind:draft
@@ -798,6 +813,26 @@
                   </button>
                 {/each}
               </div>
+
+              <section class="info-section" aria-label="Pi telemetry">
+                <div class="panel-head"><span class="eyebrow">Pi telemetry</span><small>{nonPresetStatuses.length + aboveWidgets.length + belowWidgets.length} items</small></div>
+                {#if nonPresetStatuses.length || aboveWidgets.length || belowWidgets.length}
+                  <div class="pi-status-feed side">
+                    {#if nonPresetStatuses.length}
+                      <div class="status-row side">
+                        {#each nonPresetStatuses as status}
+                          <span class="status-chip"><small>{status.key}</small><strong>{stripAnsi(status.text).trim()}</strong></span>
+                        {/each}
+                      </div>
+                    {/if}
+                    {#each [...aboveWidgets, ...belowWidgets] as widget (widget.key)}
+                      <pre class="pi-widget" aria-label={`pi widget ${widget.key}`}>{widget.lines.map(stripAnsi).join('\n')}</pre>
+                    {/each}
+                  </div>
+                {:else}
+                  <p class="empty-note">No extension status or widgets yet.</p>
+                {/if}
+              </section>
             </div>
           {:else if activePane === 'home'}
             <div class="tool-card__body info-body">

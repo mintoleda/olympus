@@ -3,11 +3,9 @@
     ConfigChooser,
     PiCommandOption,
     PiModelOption,
-    PiSession,
-    StatusEntry,
-    WidgetEntry
+    PiSession
   } from '../types/pi';
-  import { formatTime, stripAnsi } from '../utils/pi';
+  import { formatTime } from '../utils/pi';
 
   type ProviderCount = { provider: string; count: number };
 
@@ -20,9 +18,6 @@
     activeProviderModels,
     filteredModels,
     visibleCommands,
-    nonPresetStatuses,
-    aboveWidgets,
-    belowWidgets,
     error,
     chatLogEl = $bindable<HTMLElement>(),
     draft = $bindable<string>(),
@@ -46,9 +41,6 @@
     activeProviderModels: PiModelOption[];
     filteredModels: PiModelOption[];
     visibleCommands: PiCommandOption[];
-    nonPresetStatuses: StatusEntry[];
-    aboveWidgets: WidgetEntry[];
-    belowWidgets: WidgetEntry[];
     error: string;
     chatLogEl?: HTMLElement;
     draft: string;
@@ -78,6 +70,17 @@
     typeof activeSession.status === 'string' && activeSession.status.startsWith('running:')
   );
   let canSubmit = $derived(draft.trim().length > 0);
+
+  function handlePromptKeydown(event: KeyboardEvent) {
+    if (event.key !== 'Enter') return;
+    event.preventDefault();
+    if (event.repeat) return;
+    if (isStreaming) {
+      if (canSubmit) onSteer();
+      return;
+    }
+    onSend();
+  }
 </script>
 
 <div class="chat-body">
@@ -128,20 +131,6 @@
       {/if}
     {/each}
   </div>
-  {#if nonPresetStatuses.length || aboveWidgets.length}
-    <div class="pi-status-feed">
-      {#if nonPresetStatuses.length}
-        <div class="status-row">
-          {#each nonPresetStatuses as status}
-            <span class="status-chip"><small>{status.key}</small><strong>{stripAnsi(status.text).trim()}</strong></span>
-          {/each}
-        </div>
-      {/if}
-      {#each aboveWidgets as widget (widget.key)}
-        <pre class="pi-widget" aria-label={`pi widget ${widget.key}`}>{widget.lines.map(stripAnsi).join('\n')}</pre>
-      {/each}
-    </div>
-  {/if}
 </div>
 
 {#if activeChooser}
@@ -222,8 +211,7 @@
       bind:value={draft}
       placeholder={isStreaming ? `Steer Pi in ${activeSession.name}…` : `Ask Pi in ${activeSession.name}…`}
       oninput={onEnsureCommandOptions}
-      onkeydown={(event) =>
-        event.key === 'Enter' && (isStreaming ? canSubmit && onSteer() : onSend())}
+      onkeydown={handlePromptKeydown}
     />
     {#if isStreaming}
       <button onclick={() => onAbort(isInBash ? 'abort_bash' : 'abort')} title={isInBash ? 'Abort running bash' : 'Abort current turn'}>Abort</button>
@@ -232,12 +220,5 @@
       <button onclick={onSend} disabled={!canSubmit}>Send</button>
     {/if}
   </div>
-  {#if belowWidgets.length}
-    <div class="pi-status-feed below">
-      {#each belowWidgets as widget (widget.key)}
-        <pre class="pi-widget" aria-label={`pi widget ${widget.key}`}>{widget.lines.map(stripAnsi).join('\n')}</pre>
-      {/each}
-    </div>
-  {/if}
   {#if error}<p class="error">{error}</p>{/if}
 </div>
