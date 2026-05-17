@@ -22,6 +22,8 @@ struct ChatMessage {
     role: String,
     content: String,
     timestamp: u64,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    msg_type: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -249,6 +251,7 @@ fn mark_status(app: &AppHandle, session_id: &str, status: &str) {
             role: "status".into(),
             content: status.into(),
             timestamp: now_ms(),
+            msg_type: None,
         },
     );
 }
@@ -262,6 +265,21 @@ fn append_assistant_delta(app: &AppHandle, session_id: &str, message_id: &str, d
             role: "assistant".into(),
             content: delta.into(),
             timestamp: now_ms(),
+            msg_type: None,
+        },
+    );
+}
+
+fn append_thinking_delta(app: &AppHandle, session_id: &str, message_id: &str, delta: &str) {
+    emit_message(
+        app,
+        session_id,
+        ChatMessage {
+            id: message_id.into(),
+            role: "assistant".into(),
+            content: delta.into(),
+            timestamp: now_ms(),
+            msg_type: Some("thinking".into()),
         },
     );
 }
@@ -279,6 +297,7 @@ fn finalize_assistant(app: &AppHandle, session_id: &str, message_id: &str, conte
                     content
                 },
                 timestamp: now_ms(),
+                msg_type: None,
             });
             session.status = "idle".into();
         }
@@ -292,8 +311,30 @@ fn finalize_assistant(app: &AppHandle, session_id: &str, message_id: &str, conte
             role: "status".into(),
             content: "idle".into(),
             timestamp: now_ms(),
+            msg_type: None,
         },
     );
+}
+
+fn finalize_thinking(app: &AppHandle, session_id: &str, message_id: &str, content: String) {
+    if content.trim().is_empty() {
+        return;
+    }
+    {
+        let store = app.state::<SessionStore>();
+        if let Ok(mut sessions) = store.sessions.lock() {
+            if let Some(session) = sessions.get_mut(session_id) {
+                session.messages.push(ChatMessage {
+                    id: message_id.into(),
+                    role: "assistant".into(),
+                    content,
+                    timestamp: now_ms(),
+                    msg_type: Some("thinking".into()),
+                });
+            }
+            let _ = save_sessions(app, &sessions);
+        };
+    }
 }
 
 fn value_string(value: Option<&Value>) -> Option<String> {
@@ -484,9 +525,23 @@ fn handle_set_status(app: &AppHandle, session_id: &str, event: &Value) {
             Err(_) => return,
         };
         let entries = map.entry(session_id.to_string()).or_default();
+        let was_present = entries.iter().any(|e| e.key == key);
         entries.retain(|entry| entry.key != key);
-        if let Some(text) = text {
-            entries.push(StatusEntry { key, text });
+        if let Some(ref text) = text {
+            if !was_present {
+                emit_message(
+                    app,
+                    session_id,
+                    ChatMessage {
+                        id: format!("{session_id}-tool-{key}-{}", now_ms()),
+                        role: "assistant".into(),
+                        content: format!("{key}: {text}"),
+                        timestamp: now_ms(),
+                        msg_type: Some("tool".into()),
+                    },
+                );
+            }
+            entries.push(StatusEntry { key, text: text.clone() });
         }
         entries.clone()
     };
@@ -714,6 +769,8 @@ fn spawn_pi_inner(
     thread::spawn(move || {
         let mut current_message_id = String::new();
         let mut full_response = String::new();
+        let mut current_thinking_id = String::new();
+        let mut thinking_response = String::new();
         let reader = BufReader::new(stdout);
 
         for line in reader.lines().map_while(Result::ok) {
@@ -749,6 +806,7 @@ fn spawn_pi_inner(
                                 role: "assistant".into(),
                                 content: text,
                                 timestamp: now_ms(),
+                                msg_type: None,
                             },
                         );
                         mark_status(&reader_app, &reader_session_id, "idle");
@@ -794,26 +852,74 @@ fn spawn_pi_inner(
                 Some("agent_start") => {
                     current_message_id = format!("{reader_session_id}-a-{}", now_ms());
                     full_response.clear();
+                    current_thinking_id.clear();
+                    thinking_response.clear();
                     mark_status(&reader_app, &reader_session_id, "streaming");
                 }
                 Some("message_update") => {
                     let delta_event = &event["assistantMessageEvent"];
-                    if delta_event.get("type").and_then(Value::as_str) == Some("text_delta") {
-                        if let Some(delta) = delta_event.get("delta").and_then(Value::as_str) {
-                            if current_message_id.is_empty() {
-                                current_message_id = format!("{reader_session_id}-a-{}", now_ms());
+                    match delta_event.get("type").and_then(Value::as_str) {
+                        Some("thinking_delta" | "thinking_block_delta") => {
+                            let thinking = delta_event
+                                .get("delta")
+                                .and_then(|d| {
+                                    d.as_str()
+                                        .or_else(|| d.get("thinking").and_then(Value::as_str))
+                                })
+                                .unwrap_or("");
+                            if !thinking.is_empty() {
+                                if current_thinking_id.is_empty() {
+                                    current_thinking_id =
+                                        format!("{reader_session_id}-th-{}", now_ms());
+                                    mark_status(&reader_app, &reader_session_id, "thinking");
+                                }
+                                thinking_response.push_str(thinking);
+                                append_thinking_delta(
+                                    &reader_app,
+                                    &reader_session_id,
+                                    &current_thinking_id,
+                                    thinking,
+                                );
                             }
-                            full_response.push_str(delta);
-                            append_assistant_delta(
-                                &reader_app,
-                                &reader_session_id,
-                                &current_message_id,
-                                delta,
-                            );
                         }
+                        Some("text_delta") => {
+                            if let Some(delta) =
+                                delta_event.get("delta").and_then(Value::as_str)
+                            {
+                                if current_message_id.is_empty() {
+                                    current_message_id =
+                                        format!("{reader_session_id}-a-{}", now_ms());
+                                }
+                                if full_response.is_empty() {
+                                    mark_status(
+                                        &reader_app,
+                                        &reader_session_id,
+                                        "generating",
+                                    );
+                                }
+                                full_response.push_str(delta);
+                                append_assistant_delta(
+                                    &reader_app,
+                                    &reader_session_id,
+                                    &current_message_id,
+                                    delta,
+                                );
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 Some("agent_end") => {
+                    if !current_thinking_id.is_empty() {
+                        finalize_thinking(
+                            &reader_app,
+                            &reader_session_id,
+                            &current_thinking_id,
+                            thinking_response.clone(),
+                        );
+                        current_thinking_id.clear();
+                        thinking_response.clear();
+                    }
                     if current_message_id.is_empty() {
                         current_message_id = format!("{reader_session_id}-a-{}", now_ms());
                     }
@@ -882,6 +988,7 @@ fn create_session(
                 "Pi session ready. Olympus will resume this conversation by its Pi session id."
                     .into(),
             timestamp: now_ms(),
+            msg_type: None,
         }],
         session_dir: String::new(),
         pi_session_id: None,
@@ -1256,6 +1363,7 @@ fn send_message(
         role: "user".into(),
         content: content.clone(),
         timestamp: now_ms(),
+        msg_type: None,
     };
 
     {
