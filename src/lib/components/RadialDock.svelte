@@ -6,11 +6,13 @@
   let {
     groupedSessions,
     activeSessionId,
+    openSignal = 0,
     onOpenSession,
     onCloseSession
   }: {
     groupedSessions: [string, PiSession[]][];
     activeSessionId: string;
+    openSignal?: number;
     onOpenSession: (id: string) => void;
     onCloseSession: (id: string) => void;
   } = $props();
@@ -22,6 +24,7 @@
   let hoveredSession = $state<string | null>(null);
   let closeZone = $state(false);
   let layoutScale = $state(1);
+  let lastOpenSignal = $state(0);
 
   const INNER_RADIUS = 90;
   const OUTER_RADIUS = 170;
@@ -220,6 +223,17 @@
     hoveredSession = null;
     closeZone = false;
   }
+
+  $effect(() => {
+    if (openSignal === lastOpenSignal) return;
+    lastOpenSignal = openSignal;
+    if (openSignal <= 0) return;
+    if (active) {
+      dismiss();
+      return;
+    }
+    activateAt(cursor.x || window.innerWidth / 2, cursor.y || window.innerHeight / 2);
+  });
 
   function handleResize() {
     if (!active) return;

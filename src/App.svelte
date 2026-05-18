@@ -51,6 +51,7 @@
   let piImportBusy = '';
   let sendInFlight = false;
   let steerInFlight = false;
+  let radialDockOpenSignal = 0;
 
   $: activeSession = sessions.find((session) => session.id === activeSessionId) ?? sessions[0];
   $: groupedSessions = Object.entries(
@@ -85,6 +86,10 @@
     const cached = commandCache.get(activeSession.id);
     commandOptions = cached ?? [];
     loadCommandOptions(activeSession.id);
+  }
+
+  function openSessionMenu() {
+    radialDockOpenSignal += 1;
   }
 
   async function cyclePrimary(direction: 1 | -1 = 1) {
@@ -455,6 +460,7 @@
 
 <main class="void" bind:this={rootEl}>
   <TitleBar
+    onMenuClick={openSessionMenu}
     onSettingsClick={() => openConfigChooser('thinking')}
   />
   <section class="void-stage">
@@ -587,6 +593,7 @@
   <RadialDock
     {groupedSessions}
     {activeSessionId}
+    openSignal={radialDockOpenSignal}
     onOpenSession={openSession}
     onCloseSession={closeSession}
   />
