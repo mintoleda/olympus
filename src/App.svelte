@@ -1,31 +1,17 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte';
   import { open } from '@tauri-apps/plugin-dialog';
-  import {
-    animateChatHistory,
-    animateInspectorRefresh,
-    animateLatestMessage,
-    animateMetricTick,
-    animatePaneChange,
-    animateVoidEnter,
-    animateStreamingStatus,
-    attachInteractionAnimations,
-    createAppAnimationScope
-  } from './animations';
-  import type { Scope } from 'animejs';
   import ChatPane from './lib/components/ChatPane.svelte';
   import ExtensionRequestDialog from './lib/components/ExtensionRequestDialog.svelte';
-  import HomePane from './lib/components/HomePane.svelte';
   import RadialDock from './lib/components/RadialDock.svelte';
+  import TitleBar from './lib/components/TitleBar.svelte';
   import { attachPiEventListeners } from './lib/services/piEvents';
   import { piClient } from './lib/services/piClient';
   import {
     PRIMARY_CYCLE,
-    panes,
     thinkingLevels,
     type ConfigChooser,
     type ExtensionUiRequest,
-    type PaneId,
     type PiCommandOption,
     type PiModelOption,
     type PiSession,
@@ -38,15 +24,15 @@
     nextPreset,
     parsePreset,
     rankCommands,
-    stripAnsi
+    stripAnsi,
+    relativeTime,
+    historyDate
   } from './lib/utils/pi';
 
-  let activePane: PaneId = 'home';
   let sessions: PiSession[] = [];
   let activeSessionId = '';
   let draft = '';
   let error = '';
-  let sessionsCollapsed = false;
   let activeChooser: ConfigChooser = null;
   let modelOptions: PiModelOption[] = [];
   let modelLoading = false;
@@ -60,34 +46,12 @@
   let rootEl: HTMLElement;
   let chatLogEl: HTMLElement;
   let zoom = 1;
-  let animationScope: Scope | undefined;
-  let animationReady = false;
-  let lastAnimatedPane: PaneId = activePane;
-  let lastAnimatedCollapsed = sessionsCollapsed;
-  let menuOpen = false;
-  let infoCardVisible = true;
   let pendingPiImports: PiSessionMeta[] = [];
   let piImportsLoaded = false;
   let piImportBusy = '';
   let sendInFlight = false;
   let steerInFlight = false;
 
-  function menuClickOutside(node: HTMLElement) {
-    const handle = (e: MouseEvent) => {
-      if (!node.contains(e.target as Node)) menuOpen = false;
-    };
-    const add = () => document.addEventListener('mousedown', handle);
-    const remove = () => document.removeEventListener('mousedown', handle);
-    setTimeout(add, 0);
-    return { destroy: remove };
-  }
-  let lastAnimatedMessageCount = 0;
-  let lastAnimatedStatus = '';
-  let lastAnimatedSessionId = '';
-  let lastAnimatedSessionCount = 0;
-  let lastAnimatedMetricKey = '';
-  let sessionRailAnimationFrame = 0;
-  $: active = panes.find((pane) => pane.id === activePane) ?? panes[0];
   $: activeSession = sessions.find((session) => session.id === activeSessionId) ?? sessions[0];
   $: groupedSessions = Object.entries(
     sessions.reduce<Record<string, PiSession[]>>((groups, session) => {
@@ -97,21 +61,12 @@
   ).sort(([a], [b]) => a.localeCompare(b));
   $: recentSessions = [...sessions]
     .sort((a, b) => latestTimestamp(b) - latestTimestamp(a))
-    .slice(0, 6);
-  $: importedFiles = new Set(sessions.map((s) => s.pi_session_file).filter((p): p is string => !!p));
-  $: visiblePiImports = pendingPiImports.filter((meta) => !importedFiles.has(meta.session_file));
-  $: activeProjectName = activeSession?.project_path.split('/').filter(Boolean).at(-1) ?? 'workspace';
-  $: piRuntimeFacts = [
-    { key: 'provider' as const, label: 'Provider', value: activeSession?.provider ?? 'detecting', note: 'current Pi backend' },
-    { key: 'model' as const, label: 'Model', value: activeSession?.model ?? 'waiting', note: activeSession?.model_id ?? 'selected model' },
-    { key: 'thinking' as const, label: 'Thinking', value: activeSession?.thinking_level ?? 'default', note: 'reasoning level' }
-  ];
-  $: piWrapperDetails = [
-    ...piRuntimeFacts,
-    { label: 'Pi session', value: activeSession?.pi_session_id ?? 'not linked yet', note: 'resume identifier' },
-    { label: 'Session file', value: activeSession?.pi_session_file ?? 'managed by Pi', note: 'local transcript source' },
-    { label: 'Status', value: activeSession?.status ?? 'offline', note: activeSession ? 'RPC connection state' : 'create a session to start Pi' }
-  ];
+    .slice(0, 10);
+  $: activeStatuses = activeSession ? sessionStatuses.get(activeSession.id) ?? [] : [];
+  $: presetStatus = activeStatuses.find((entry) => entry.key === 'opencode-preset' || entry.key === 'preset');
+  $: activePreset = parsePreset(presetStatus?.text);
+  $: commandSearch = draft.startsWith('/') ? draft.slice(1).split(/\s+/, 1)[0].toLowerCase() : '';
+  $: visibleCommands = draft.startsWith('/') ? rankCommands(commandOptions, commandSearch).slice(0, 12) : [];
   $: providers = Array.from(new Set(modelOptions.map((model) => model.provider))).sort();
   $: providerCounts = providers.map((provider) => ({
     provider,
@@ -126,67 +81,17 @@
   $: extensionRequestSession = activeExtensionRequest
     ? sessions.find((s) => s.id === activeExtensionRequest!.session_id)
     : undefined;
-  $: activeStatuses = activeSession ? sessionStatuses.get(activeSession.id) ?? [] : [];
-  $: activeWidgets = activeSession ? sessionWidgets.get(activeSession.id) ?? [] : [];
-  $: presetStatus = activeStatuses.find((entry) => entry.key === 'opencode-preset' || entry.key === 'preset');
-  $: activePreset = parsePreset(presetStatus?.text);
-  $: nonPresetStatuses = activeStatuses
-    .filter((entry) => entry.key !== 'opencode-preset' && entry.key !== 'preset')
-    .filter((entry) => stripAnsi(entry.text).trim().length > 0);
-  $: aboveWidgets = activeWidgets.filter((widget) => widget.placement !== 'belowEditor');
-  $: belowWidgets = activeWidgets.filter((widget) => widget.placement === 'belowEditor');
-  $: commandSearch = draft.startsWith('/') ? draft.slice(1).split(/\s+/, 1)[0].toLowerCase() : '';
-  $: visibleCommands = draft.startsWith('/') ? rankCommands(commandOptions, commandSearch).slice(0, 12) : [];
-  $: homeStats = [
-    { label: 'Sessions', value: String(sessions.length).padStart(2, '0'), note: sessions.length === 1 ? 'context mounted' : 'contexts mounted' },
-    { label: 'Project', value: activeProjectName, note: activeSession?.status ?? 'waiting' },
-    { label: 'Events', value: String(sessions.reduce((count, session) => count + session.messages.length, 0)), note: 'local transcript entries' }
-  ];
-  $: activeMessageCount = activeSession?.messages.length ?? 0;
-  $: metricKey = `${sessions.length}:${activeProjectName}:${activeMessageCount}`;
-  $: if (animationReady && rootEl && activePane !== lastAnimatedPane) {
-    lastAnimatedPane = activePane;
-    tick().then(() => animatePaneChange(rootEl));
-  }
-  $: if (animationReady && rootEl && activeSession?.id && activeSession.id !== lastAnimatedSessionId) {
-    lastAnimatedSessionId = activeSession.id;
-    tick().then(() => {
-      animateChatHistory(rootEl);
-      animateInspectorRefresh(rootEl);
-    });
-  }
   $: if (activeSession?.id) {
     const cached = commandCache.get(activeSession.id);
     commandOptions = cached ?? [];
     loadCommandOptions(activeSession.id);
   }
-  $: if (animationReady && rootEl && sessions.length !== lastAnimatedSessionCount) {
-    lastAnimatedSessionCount = sessions.length;
-    tick().then(() => animateMetricTick(rootEl));
-  }
-  $: if (animationReady && rootEl && metricKey !== lastAnimatedMetricKey) {
-    lastAnimatedMetricKey = metricKey;
-    tick().then(() => animateMetricTick(rootEl));
-  }
-  $: if (animationReady && rootEl && activeMessageCount > lastAnimatedMessageCount) {
-    lastAnimatedMessageCount = activeMessageCount;
-    tick().then(() => {
-      animateLatestMessage(rootEl);
-      scrollChatToBottom();
-    });
-  }
-  $: if (animationReady && rootEl && activeSession?.status && activeSession.status !== lastAnimatedStatus) {
-    lastAnimatedStatus = activeSession.status;
-    if (['streaming','waiting','resetting'].includes(activeSession.status)) tick().then(() => animateStreamingStatus(rootEl));
-  }
-
 
   async function cyclePrimary(direction: 1 | -1 = 1) {
     if (!activeSession) return;
     const target = nextPreset(activePreset, PRIMARY_CYCLE, direction);
     await runAction(() => piClient.sendPiCommand(activeSession!.id, `/primary ${target}`));
   }
-
 
   async function scrollChatToBottom() {
     await tick();
@@ -212,21 +117,6 @@
     }
   }
 
-  async function importPiSession(meta: PiSessionMeta) {
-    if (piImportBusy) return;
-    piImportBusy = meta.session_file;
-    const session = await runAction(() => piClient.importPiSession(meta.session_file));
-    piImportBusy = '';
-    if (!session) return;
-    sessions = [...sessions.filter((item) => item.id !== session.id), session];
-    activeSessionId = session.id;
-    activePane = 'chat';
-    await refreshSessions();
-    await refreshPiImports();
-    await scrollChatToBottom();
-  }
-
-
   async function runAction<T>(fn: () => Promise<T>): Promise<T | undefined> {
     try {
       const result = await fn();
@@ -243,7 +133,6 @@
     if (!session) return;
     sessions = [...sessions.filter((item) => item.id !== session.id), session];
     activeSessionId = session.id;
-    activePane = 'chat';
     await refreshSessions();
     await refreshPiImports();
     await scrollChatToBottom();
@@ -265,21 +154,31 @@
 
   async function openSession(id: string) {
     await switchSession(id);
-    activePane = 'chat';
   }
 
   async function closeSession(id: string) {
-    const ok = await runAction(() => piClient.closeSession(id));
-    if (ok === undefined) return;
-    await refreshSessions();
-    await refreshPiImports();
+    sessions = sessions.filter((s) => s.id !== id);
+    if (activeSessionId === id) {
+      activeSessionId = sessions[0]?.id ?? '';
+    }
+    extensionRequestQueue = extensionRequestQueue.filter((r) => r.session_id !== id);
+    sessionStatuses.delete(id);
+    sessionWidgets.delete(id);
+    sessionStatuses = sessionStatuses;
+    sessionWidgets = sessionWidgets;
+
+    piClient.closeSession(id).then(() => {
+      refreshSessions();
+      refreshPiImports();
+    }).catch((err) => {
+      error = String(err);
+    });
   }
 
   async function send() {
     if (sendInFlight || !activeSession || !draft.trim()) return;
     sendInFlight = true;
     try {
-      activePane = 'chat';
       const sessionId = activeSession.id;
       const content = draft.trim();
       if (content.startsWith('/') && await handleSlashCommand(content)) {
@@ -322,21 +221,9 @@
 
   function handleGlobalKeydown(event: KeyboardEvent) {
     if ((event.ctrlKey || event.metaKey) && !event.shiftKey) {
-      if (event.key === '+' || event.key === '=') {
-        event.preventDefault();
-        setZoom(zoom + 0.05);
-        return;
-      }
-      if (event.key === '-' || event.key === '_') {
-        event.preventDefault();
-        setZoom(zoom - 0.05);
-        return;
-      }
-      if (event.key === '0') {
-        event.preventDefault();
-        setZoom(1);
-        return;
-      }
+      if (event.key === '+' || event.key === '=') { event.preventDefault(); setZoom(zoom + 0.05); return; }
+      if (event.key === '-' || event.key === '_') { event.preventDefault(); setZoom(zoom - 0.05); return; }
+      if (event.key === '0') { event.preventDefault(); setZoom(1); return; }
     }
     if (event.key === 'Tab' && event.shiftKey) {
       const promptEl = document.getElementById('prompt-input');
@@ -344,28 +231,6 @@
       event.preventDefault();
       cyclePrimary(event.ctrlKey || event.metaKey ? -1 : 1);
     }
-  }
-
-  let hotkeysOpen = false;
-  let fps = 0;
-
-  function startFpsCounter() {
-    let frames = 0;
-    let last = performance.now();
-    let frameId = 0;
-
-    const loop = (now: number) => {
-      frames += 1;
-      if (now - last >= 1000) {
-        fps = Math.round((frames * 1000) / (now - last));
-        frames = 0;
-        last = now;
-      }
-      frameId = requestAnimationFrame(loop);
-    };
-
-    frameId = requestAnimationFrame(loop);
-    return () => cancelAnimationFrame(frameId);
   }
 
   async function handleSlashCommand(content: string): Promise<boolean> {
@@ -376,12 +241,6 @@
       case 'scoped-models':
         await openConfigChooser('model');
         if (args) modelFilter = args;
-        return true;
-      case 'settings':
-        activePane = 'settings';
-        return true;
-      case 'hotkeys':
-        hotkeysOpen = true;
         return true;
       case 'new':
         await createSession();
@@ -395,17 +254,6 @@
       case 'name':
         if (args) await runAction(() => piClient.renamePiSession(activeSession!.id, args));
         return true;
-      case 'session':
-        sessions = sessions.map((session) => session.id === activeSession!.id ? {
-          ...session,
-          messages: [...session.messages, {
-            id: `${session.id}-session-${Date.now()}`,
-            role: 'status',
-            content: `session: ${session.pi_session_id ?? session.id}\nmodel: ${session.provider ?? 'unknown'}/${session.model_id ?? session.model ?? 'unknown'}\nthinking: ${session.thinking_level ?? 'default'}\nmessages: ${session.messages.length}`,
-            timestamp: Date.now()
-          }]
-        } : session);
-        return true;
       case 'stop':
         if (activeSession) await runAction(() => piClient.stopSession(activeSession!.id));
         return true;
@@ -417,15 +265,11 @@
     }
   }
 
-
   async function loadCommandOptions(sessionId: string, force = false) {
     if (!sessionId) return;
     if (!force) {
       const cached = commandCache.get(sessionId);
-      if (cached) {
-        commandOptions = cached;
-        return;
-      }
+      if (cached) { commandOptions = cached; return; }
     }
     if (commandFetchInFlight === sessionId) return;
     commandFetchInFlight = sessionId;
@@ -485,19 +329,11 @@
       modelOptions.find((item) => item.provider === provider);
     if (!model) return;
     activeChooser = null;
-    const ok = await runAction(() =>
-      piClient.setPiModel(activeSession!.id, model.provider, model.id)
-    );
+    const ok = await runAction(() => piClient.setPiModel(activeSession!.id, model.provider, model.id));
     if (ok !== undefined) {
       sessions = sessions.map((session) =>
         session.id === activeSession!.id
-          ? {
-              ...session,
-              provider: model.provider,
-              model: model.id,
-              model_id: model.id,
-              status: 'updating'
-            }
+          ? { ...session, provider: model.provider, model: model.id, model_id: model.id, status: 'updating' }
           : session
       );
     }
@@ -506,19 +342,11 @@
   async function selectModel(model: PiModelOption) {
     if (!activeSession) return;
     activeChooser = null;
-    const ok = await runAction(() =>
-      piClient.setPiModel(activeSession!.id, model.provider, model.id)
-    );
+    const ok = await runAction(() => piClient.setPiModel(activeSession!.id, model.provider, model.id));
     if (ok !== undefined) {
       sessions = sessions.map((session) =>
         session.id === activeSession!.id
-          ? {
-              ...session,
-              provider: model.provider,
-              model: model.id,
-              model_id: model.id,
-              status: 'updating'
-            }
+          ? { ...session, provider: model.provider, model: model.id, model_id: model.id, status: 'updating' }
           : session
       );
     }
@@ -538,16 +366,6 @@
     let disposed = false;
     setZoom(zoom);
     window.addEventListener('keydown', handleGlobalKeydown);
-    const detachInteractions = attachInteractionAnimations(rootEl);
-    const stopFpsCounter = startFpsCounter();
-    animationScope = createAppAnimationScope(rootEl);
-    animateVoidEnter(rootEl, animationScope);
-    animationReady = true;
-    lastAnimatedMessageCount = activeMessageCount;
-    lastAnimatedStatus = activeSession?.status ?? '';
-    lastAnimatedSessionId = activeSession?.id ?? '';
-    lastAnimatedSessionCount = sessions.length;
-    lastAnimatedMetricKey = metricKey;
 
     (async () => {
       try {
@@ -560,19 +378,12 @@
               const existing = session.messages.find((item) => item.id === message.id);
               if (existing) {
                 if (isCanonical) {
-                  return {
-                    ...session,
-                    messages: session.messages.map((item) =>
-                      item.id === message.id ? message : item
-                    )
-                  };
+                  return { ...session, messages: session.messages.map((item) => item.id === message.id ? message : item) };
                 }
                 return {
                   ...session,
                   status: message.role === 'assistant' ? 'streaming' : session.status,
-                  messages: session.messages.map((item) =>
-                    item.id === message.id ? { ...item, content: item.content + message.content } : item
-                  )
+                  messages: session.messages.map((item) => item.id === message.id ? { ...item, content: item.content + message.content } : item)
                 };
               }
               return {
@@ -581,6 +392,7 @@
                 messages: [...session.messages, message]
               };
             });
+            scrollChatToBottom();
           },
           onSessionUpdate: ({ session: updated }) => {
             sessions = sessions.some((session) => session.id === updated.id)
@@ -604,25 +416,12 @@
           onNotify: ({ session_id, message, level }) => {
             sessions = sessions.map((session) =>
               session.id === session_id
-                ? {
-                    ...session,
-                    messages: [
-                      ...session.messages,
-                      {
-                        id: `${session_id}-notify-${Date.now()}`,
-                        role: 'status',
-                        content: `${level}: ${stripAnsi(message)}`,
-                        timestamp: Date.now()
-                      }
-                    ]
-                  }
+                ? { ...session, messages: [...session.messages, { id: `${session_id}-notify-${Date.now()}`, role: 'status', content: `${level}: ${stripAnsi(message)}`, timestamp: Date.now() }] }
                 : session
             );
           },
           onEditorText: ({ session_id, text }) => {
-            if (activeSession && session_id === activeSession.id) {
-              draft = text;
-            }
+            if (activeSession && session_id === activeSession.id) draft = text;
           },
           onTitle: ({ session_id, title }) => {
             sessions = sessions.map((session) =>
@@ -630,16 +429,11 @@
             );
           },
           onSessionClosed: ({ session_id }) => {
-            extensionRequestQueue = extensionRequestQueue.filter(
-              (req) => req.session_id !== session_id
-            );
+            extensionRequestQueue = extensionRequestQueue.filter((req) => req.session_id !== session_id);
           }
         });
 
-        if (disposed) {
-          listeners.forEach((cleanup) => cleanup());
-          return;
-        }
+        if (disposed) { listeners.forEach((cleanup) => cleanup()); return; }
         unlisteners = listeners;
         await refreshSessions();
         await refreshPiImports();
@@ -655,83 +449,46 @@
       disposed = true;
       unlisteners.forEach((unlisten) => unlisten());
       window.removeEventListener('keydown', handleGlobalKeydown);
-      if (sessionRailAnimationFrame) cancelAnimationFrame(sessionRailAnimationFrame);
-      detachInteractions();
-      stopFpsCounter();
-      animationScope?.revert();
     };
   });
 </script>
 
 <main class="void" bind:this={rootEl}>
-  <!-- Top-left chrome -->
-  <header class="void-chrome">
-    <button class="menu-pill" on:click={() => (menuOpen = !menuOpen)}>MENU</button>
-    <button class="gear-btn" on:click={() => { activePane = 'settings'; menuOpen = false; }} aria-label="Settings">⚙</button>
-    {#if menuOpen}
-      <div class="menu-popover" use:menuClickOutside>
-        <div class="menu-section">
-          <p class="menu-head">TOOLS</p>
-          {#each panes as pane}
-            <button class="menu-row" class:active={pane.id === activePane} on:click={() => { activePane = pane.id; if (pane.id !== 'chat') activeChooser = null; menuOpen = false; }}>
-              <span>{pane.label}</span>
-            </button>
-          {/each}
-        </div>
-        <div class="menu-section">
-          <p class="menu-head">SESSIONS</p>
-          {#if recentSessions.length}
-            {#each recentSessions as session}
-              <button class="menu-row" class:current={session.id === activeSessionId} on:click={() => { openSession(session.id); menuOpen = false; }}>
-                <span>{session.name}</span><small>{session.status}</small>
-              </button>
-            {/each}
-          {:else}
-            <p class="menu-empty">No sessions yet</p>
-          {/if}
-        </div>
-        <div class="menu-footer">
-          <button on:click={() => { pickProjectAndCreate(); menuOpen = false; }}>Open folder</button>
-          <button on:click={() => { createSession(); menuOpen = false; }}>New session</button>
-        </div>
-      </div>
-    {/if}
-  </header>
-
-  <!-- Stage -->
+  <TitleBar
+    onSettingsClick={() => openConfigChooser('thinking')}
+  />
   <section class="void-stage">
-    <div class="tool-shell" class:no-info={!(infoCardVisible && (activePane === 'chat' || activePane === 'home'))}>
-
-      <!-- Main tool card -->
-      <div class="tool-card">
-        <div class="tool-card__head">
-          <div class="tool-card__icon">{active.key}</div>
-          <span class="tool-card__label">{active.label}</span>
-          <div class="tool-card__actions">
-            {#if activePane === 'chat' && activeSession}
+    <div class="app-layout">
+      <!-- Main conversation card -->
+      <div class="main-card">
+        <!-- Tab bar -->
+        <div class="tab-bar">
+          {#each sessions as session}
+            <div class="tab-wrapper" class:active={session.id === activeSessionId}>
               <button
-                class="preset-chip preset-{activePreset ?? 'off'}"
-                on:click={() => cyclePrimary(1)}
-                title="Cycle plan → build → ask → off"
-              ><small>primary</small><strong>{activePreset ?? 'off'}</strong></button>
-              <span class="pi-state" class:streaming={['streaming','thinking','generating','waiting','resetting','retrying','compacting'].includes(activeSession.status)}>{activeSession.status}</span>
-            {/if}
-            {#if activePane === 'chat' || activePane === 'home'}
-              <button class="info-toggle" on:click={() => (infoCardVisible = !infoCardVisible)} title={infoCardVisible ? 'Hide info' : 'Show info'}>
-                {infoCardVisible ? '↦' : '↤'}
-              </button>
-            {/if}
-          </div>
+                class="tab"
+                class:active={session.id === activeSessionId}
+                on:click={() => openSession(session.id)}
+              >{#if session.id === activeSessionId}<span class="tab-dot"></span>{/if}{session.name}</button>
+              <button
+                class="tab-close"
+                on:click|stopPropagation={() => closeSession(session.id)}
+                title="Close session"
+              >×</button>
+            </div>
+          {/each}
+          <button class="tab tab-add" on:click={() => createSession()} title="New session">+</button>
         </div>
 
-        {#if activePane === 'chat' && activeSession}
+        <!-- Conversation -->
+        {#if activeSession}
           <ChatPane
             activeSession={activeSession}
             activeChooser={activeChooser}
             {thinkingLevels}
             {modelLoading}
             {providerCounts}
-            {activeProviderModels}
+            activeProviderModels={activeProviderModels}
             {filteredModels}
             {visibleCommands}
             {error}
@@ -749,126 +506,74 @@
             onSteer={steer}
             onAbort={abort}
           />
-
-        {:else if activePane === 'chat'}
-          <div class="tool-card__body">
-            <div class="placeholder-copy">
-              <p class="eyebrow">CHAT / No session</p>
-              <h1>No active session.</h1>
-              <p>Open a project folder or create a new session to get started.</p>
-            </div>
+        {:else}
+          <div class="empty-state">
+            <svg class="empty-icon-svg" width="48" height="48" viewBox="0 0 48 48" fill="none">
+              <path d="M8 10C8 8.895 8.895 8 10 8H38C39.105 8 40 8.895 40 10V30C40 31.105 39.105 32 38 32H18L12 38V32H10C8.895 32 8 31.105 8 30V10Z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
+            </svg>
+            <p class="empty-label">SEND A MESSAGE TO START</p>
           </div>
           <div class="card-footer">
-            <div class="command-dock">
-              <label for="prompt-input">Prompt</label>
-              <input id="prompt-input" bind:value={draft} placeholder="Create a session first…" disabled />
-              <button disabled>Send</button>
-            </div>
-          </div>
-
-        {:else if activePane === 'home'}
-          <HomePane
-            {activeSession}
-            {homeStats}
-            {visiblePiImports}
-            {piImportBusy}
-            {piImportsLoaded}
-            sessionCount={sessions.length}
-            onResumeSession={() => (activePane = 'chat')}
-            onOpenFolder={pickProjectAndCreate}
-            onNewSession={() => createSession()}
-            onImportPiSession={importPiSession}
-          />
-
-        {:else}
-          <div class="tool-card__body">
-            <div class="placeholder-copy">
-              <p class="eyebrow">{active.key} / {active.label}</p>
-              <h1>{active.description}</h1>
-              <p>This surface will grow into a practical inspector for Pi, project state, permissions, and local tools.</p>
+            <div class="input-bar input-bar--tall">
+              <textarea id="prompt-input" placeholder="Type your input here…" rows="3" disabled></textarea>
+              <div class="input-bar-bottom">
+                <div class="input-actions"></div>
+                <button class="btn-send" disabled>Send</button>
+              </div>
             </div>
           </div>
         {/if}
       </div>
 
-      <!-- Right info card -->
-      {#if infoCardVisible && (activePane === 'chat' || activePane === 'home')}
-        <div class="tool-card info-card">
-          <div class="tool-card__head">
-            <span class="tool-card__label">{activePane === 'chat' ? 'Pi wrapper' : 'Recent work'}</span>
-            <div class="tool-card__actions">
-              {#if activePane === 'chat'}
-                <small class="pi-state" class:streaming={['streaming','thinking','generating','waiting','resetting','retrying','compacting'].includes(activeSession?.status ?? '')}>{activeSession?.status ?? 'offline'}</small>
-              {/if}
-            </div>
+      <!-- Sidebar -->
+      <aside class="sidebar">
+        <section class="sidebar-section">
+          <h3 class="sidebar-heading">Model</h3>
+          <button class="model-display" on:click={() => openConfigChooser('model')}>
+            <span class="model-name">{activeSession?.model_id ?? activeSession?.model ?? 'No model'}</span>
+            <svg class="model-chevron" width="10" height="10" viewBox="0 0 10 10" fill="none"><path d="M2.5 4L5 6.5L7.5 4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+        </section>
+
+        <section class="sidebar-section">
+          <h3 class="sidebar-heading">Session metrics</h3>
+          <div class="metrics-table">
+            <div class="metric-row"><span>Status</span><span class="metric-value">{activeSession?.status ?? 'offline'}</span></div>
+            <button class="metric-row clickable" on:click={() => openConfigChooser('provider')}><span>Provider</span><span class="metric-value">{activeSession?.provider ?? '—'}</span></button>
+            <button class="metric-row clickable" on:click={() => openConfigChooser('thinking')}><span>Thinking</span><span class="metric-value">{activeSession?.thinking_level ?? 'default'}</span></button>
+            <div class="metric-row"><span>Messages</span><span class="metric-value">{activeSession?.messages.length ?? 0}</span></div>
+            <div class="metric-row"><span>Cost</span><span class="metric-value">${(activeSession?.cost ?? 0).toFixed(3)}</span></div>
+            <div class="metric-row"><span>Input tokens</span><span class="metric-value">{activeSession?.input_tokens ?? 0}</span></div>
+            <div class="metric-row"><span>Output tokens</span><span class="metric-value">{activeSession?.output_tokens ?? 0}</span></div>
+            <div class="metric-row"><span>Total</span><span class="metric-value">{activeSession?.total_tokens ?? 0}</span></div>
           </div>
-          {#if activePane === 'chat'}
-            <div class="tool-card__body info-body">
-              <div class="meters">
-                {#each piRuntimeFacts as fact}
-                  <button class="meter-button" on:click={() => openConfigChooser(fact.key)}>
-                    <span>{fact.label}</span><strong>{fact.value}</strong><small>{fact.note}</small>
-                  </button>
-                {/each}
-              </div>
+        </section>
 
-              <section class="info-section" aria-label="Pi telemetry">
-                <div class="panel-head"><span class="eyebrow">Pi telemetry</span><small>{nonPresetStatuses.length + aboveWidgets.length + belowWidgets.length} items</small></div>
-                {#if nonPresetStatuses.length || aboveWidgets.length || belowWidgets.length}
-                  <div class="pi-status-feed side">
-                    {#if nonPresetStatuses.length}
-                      <div class="status-row side">
-                        {#each nonPresetStatuses as status}
-                          <span class="status-chip"><small>{status.key}</small><strong>{stripAnsi(status.text).trim()}</strong></span>
-                        {/each}
-                      </div>
-                    {/if}
-                    {#each [...aboveWidgets, ...belowWidgets] as widget (widget.key)}
-                      <pre class="pi-widget" aria-label={`pi widget ${widget.key}`}>{widget.lines.map(stripAnsi).join('\n')}</pre>
-                    {/each}
+        <section class="sidebar-section sidebar-history">
+          <h3 class="sidebar-heading">History</h3>
+          {#if recentSessions.length}
+            <div class="history-list">
+              {#each recentSessions as session}
+                <button
+                  class="history-item"
+                  class:active={session.id === activeSessionId}
+                  on:click={() => openSession(session.id)}
+                >
+                  <span class="history-dot"></span>
+                  <div class="history-content">
+                    <span class="history-name">{session.name}</span>
+                    <span class="history-date">{historyDate(latestTimestamp(session))}</span>
                   </div>
-                {:else}
-                  <p class="empty-note">No extension status or widgets yet.</p>
-                {/if}
-              </section>
+                </button>
+              {/each}
             </div>
-          {:else if activePane === 'home'}
-            <div class="tool-card__body info-body">
-              <div class="panel-head"><span class="eyebrow">Sessions</span><small>{recentSessions.length} entries</small></div>
-              {#if recentSessions.length}
-                <div class="recent-list">
-                  {#each recentSessions as session}
-                    <button class:current={session.id === activeSession?.id} on:click={() => openSession(session.id)}>
-                      <span class="session-dot"></span>
-                      <strong>{session.name}</strong>
-                      <small>{session.project_path}</small>
-                      <em>{session.status}</em>
-                    </button>
-                  {/each}
-                </div>
-              {:else}
-                <p class="empty-note">No sessions yet.</p>
-              {/if}
-            </div>
+          {:else}
+            <p class="empty-note">No sessions yet</p>
           {/if}
-        </div>
-      {/if}
-
+        </section>
+      </aside>
     </div>
   </section>
-
-  <!-- Global overlays -->
-  {#if hotkeysOpen}
-    <section class="global-dialog panel" aria-label="Keyboard shortcuts">
-      <div class="panel-head"><span>Keyboard shortcuts</span><button on:click={() => (hotkeysOpen = false)}>Close</button></div>
-      <ul class="hotkeys-list">
-        <li><kbd>Enter</kbd> Send prompt</li>
-        <li><kbd>/</kbd> Open command palette</li>
-        <li><kbd>Ctrl/⌘ +</kbd> / <kbd>Ctrl/⌘ -</kbd> Zoom in/out</li>
-        <li><kbd>Ctrl/⌘ 0</kbd> Reset zoom</li>
-      </ul>
-    </section>
-  {/if}
 
   {#if activeExtensionRequest}
     <ExtensionRequestDialog
@@ -885,6 +590,4 @@
     onOpenSession={openSession}
     onCloseSession={closeSession}
   />
-
-  <div class="fps-overlay">fps: {fps}</div>
 </main>

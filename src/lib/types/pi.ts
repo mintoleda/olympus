@@ -31,6 +31,10 @@ export type PiSession = {
   model_id?: string | null;
   provider?: string | null;
   thinking_level?: string | null;
+  cost?: number;
+  input_tokens?: number;
+  output_tokens?: number;
+  total_tokens?: number;
 };
 
 export type PiSessionMeta = {

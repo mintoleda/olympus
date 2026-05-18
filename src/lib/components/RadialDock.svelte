@@ -277,11 +277,11 @@
       <!-- Center indicator -->
       <div class="radial-hub">
         {#if closeZone && hoveredSession}
-          <span class="hub-label danger">close</span>
+          <span class="hub-label danger" style="--hub-chars: 5">close</span>
         {:else if hoveredSession}
-          <span class="hub-label">open</span>
+          <span class="hub-label" style="--hub-chars: 4">open</span>
         {:else}
-          <span class="hub-label dim">sessions</span>
+          <span class="hub-label dim" style="--hub-chars: 8">sessions</span>
         {/if}
       </div>
     </div>
@@ -323,11 +323,12 @@
   }
 
   .hub-label {
-    font-size: 9px;
+    font-size: calc(48px / var(--hub-chars, 5));
     text-transform: uppercase;
     letter-spacing: 0.08em;
     color: var(--accent);
     font-weight: 600;
+    white-space: nowrap;
   }
 
   .hub-label.dim { color: var(--faint); }

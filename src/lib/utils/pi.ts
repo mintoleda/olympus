@@ -44,6 +44,20 @@ export function piImportPreview(meta: PiSessionMeta): string {
   return `${meta.message_count} message${meta.message_count === 1 ? '' : 's'}`;
 }
 
+const shortDateFmt = new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric' });
+
+export function historyDate(ms: number): string {
+  if (!ms) return '';
+  const days = Math.floor((Date.now() - ms) / 86_400_000);
+  if (days === 0) return 'Today';
+  const date = shortDateFmt.format(new Date(ms));
+  if (days === 1) return `${date} · 1 day`;
+  if (days < 30) return `${date} · ${days} days`;
+  const months = Math.floor(days / 30);
+  if (months < 12) return `${date} · ${months}mo`;
+  return `${date} · ${Math.floor(months / 12)}y`;
+}
+
 export function relativeTime(ms: number): string {
   if (!ms) return '';
   const diff = Date.now() - ms;
