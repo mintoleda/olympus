@@ -76,9 +76,12 @@
   function handleKeyDown(e: KeyboardEvent) {
     if ((e.metaKey || e.ctrlKey) && e.key === 'e') {
       e.preventDefault();
-      if (active) return;
+      if (active) {
+        dismiss();
+        return;
+      }
       active = true;
-      center = { x: cursor.x, y: cursor.y };
+      center = { x: cursor.x || window.innerWidth / 2, y: cursor.y || window.innerHeight / 2 };
       hoveredFolder = null;
       hoveredSession = null;
       closeZone = false;
@@ -102,13 +105,16 @@
     }
   }
 
-  function handleKeyUp(e: KeyboardEvent) {
-    if ((e.key === 'Meta' || e.key === 'Control' || e.key === 'e') && active) {
-      if (closeZone && hoveredSession) {
-        onCloseSession(hoveredSession);
-      } else if (hoveredSession) {
-        onOpenSession(hoveredSession);
-      }
+  function handleClick(e: MouseEvent) {
+    if (!active) return;
+    const dist = distanceFromCenter(e.clientX, e.clientY);
+    if (closeZone && hoveredSession) {
+      onCloseSession(hoveredSession);
+      dismiss();
+    } else if (hoveredSession) {
+      onOpenSession(hoveredSession);
+      dismiss();
+    } else if (dist < 30) {
       dismiss();
     }
   }
@@ -174,14 +180,14 @@
 
   onMount(() => {
     window.addEventListener('keydown', handleKeyDown);
-    window.addEventListener('keyup', handleKeyUp);
     window.addEventListener('mousemove', handleMouseMove);
+    window.addEventListener('click', handleClick);
   });
 
   onDestroy(() => {
     window.removeEventListener('keydown', handleKeyDown);
-    window.removeEventListener('keyup', handleKeyUp);
     window.removeEventListener('mousemove', handleMouseMove);
+    window.removeEventListener('click', handleClick);
   });
 </script>
 

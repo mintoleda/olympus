@@ -874,14 +874,19 @@ pub(crate) fn spawn_pi_inner(
                 }
                 Some("message_end" | "message_stop") => {
                     if let Some(message) = event.get("message") {
-                        finalize_message_end(
-                            &reader_app,
-                            &reader_session_id,
-                            message,
-                            &current_message_id,
-                            &current_thinking_id,
-                            &thinking_response,
-                        );
+                        let role = message.get("role").and_then(Value::as_str).unwrap_or("assistant");
+                        // Skip user-role message_end: send_message already added the user
+                        // message optimistically. Pi echoing it back would create a duplicate.
+                        if role != "user" {
+                            finalize_message_end(
+                                &reader_app,
+                                &reader_session_id,
+                                message,
+                                &current_message_id,
+                                &current_thinking_id,
+                                &thinking_response,
+                            );
+                        }
                         message_persisted = true;
                         current_message_id.clear();
                         full_response.clear();

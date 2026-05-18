@@ -144,7 +144,10 @@ pub(crate) fn finalize_message_end(
     }
 
     if let Some(mut main_msg) = main {
-        if main_msg.id.is_empty() && !streamed_message_id.is_empty() {
+        // Prefer the streamed ID so the frontend can replace the in-progress message.
+        // build_messages_from_pi always returns a non-empty id (Pi's or a fallback),
+        // so the old `is_empty()` guard was never triggered — hence the duplication.
+        if !streamed_message_id.is_empty() {
             main_msg.id = streamed_message_id.to_string();
         }
         push_persisted(app, session_id, main_msg);
