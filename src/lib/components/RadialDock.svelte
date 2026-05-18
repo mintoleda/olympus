@@ -21,10 +21,16 @@
   let hoveredFolder = $state<string | null>(null);
   let hoveredSession = $state<string | null>(null);
   let closeZone = $state(false);
+  let layoutScale = $state(1);
 
   const INNER_RADIUS = 90;
   const OUTER_RADIUS = 170;
   const CLOSE_THRESHOLD = 230;
+  const SCREEN_MARGIN = 16;
+  const MAX_NODE_WIDTH = 152;
+  const MAX_NODE_HEIGHT = 48;
+  const NODE_ANCHOR_OFFSET = 18;
+  const HOVER_SHADOW = 20;
 
   function folderLabel(path: string) {
     return path.split('/').filter(Boolean).at(-1) ?? path;
@@ -34,6 +40,68 @@
 
   function folderColor(index: number) {
     return FOLDER_COLORS[index % FOLDER_COLORS.length];
+  }
+
+  function clamp(value: number, min: number, max: number) {
+    return Math.min(Math.max(value, min), max);
+  }
+
+  function layoutBounds() {
+    return {
+      left: OUTER_RADIUS + NODE_ANCHOR_OFFSET + HOVER_SHADOW,
+      right: OUTER_RADIUS - NODE_ANCHOR_OFFSET + MAX_NODE_WIDTH + HOVER_SHADOW,
+      top: OUTER_RADIUS + NODE_ANCHOR_OFFSET + HOVER_SHADOW,
+      bottom: OUTER_RADIUS - NODE_ANCHOR_OFFSET + MAX_NODE_HEIGHT + HOVER_SHADOW
+    };
+  }
+
+  function fitActivationPoint(x: number, y: number) {
+    const bounds = layoutBounds();
+    const availableWidth = Math.max(1, window.innerWidth - SCREEN_MARGIN * 2);
+    const availableHeight = Math.max(1, window.innerHeight - SCREEN_MARGIN * 2);
+    const scale = Math.max(
+      0.05,
+      Math.min(1, availableWidth / (bounds.left + bounds.right), availableHeight / (bounds.top + bounds.bottom))
+    );
+    const minX = Math.min(bounds.left * scale + SCREEN_MARGIN, window.innerWidth / 2);
+    const maxX = Math.max(window.innerWidth - bounds.right * scale - SCREEN_MARGIN, window.innerWidth / 2);
+    const minY = Math.min(bounds.top * scale + SCREEN_MARGIN, window.innerHeight / 2);
+    const maxY = Math.max(window.innerHeight - bounds.bottom * scale - SCREEN_MARGIN, window.innerHeight / 2);
+
+    return {
+      center: { x: clamp(x, minX, maxX), y: clamp(y, minY, maxY) },
+      scale
+    };
+  }
+
+  function localPointer(clientX: number, clientY: number) {
+    const scale = layoutScale || 1;
+    const dx = (clientX - center.x) / scale;
+    const dy = (clientY - center.y) / scale;
+    return { dx, dy, dist: Math.hypot(dx, dy) };
+  }
+
+  function activateAt(x: number, y: number) {
+    const fitted = fitActivationPoint(x, y);
+    center = fitted.center;
+    layoutScale = fitted.scale;
+    active = true;
+    hoveredFolder = null;
+    hoveredSession = null;
+    closeZone = false;
+
+    requestAnimationFrame(() => {
+      const nodes = document.querySelectorAll('.radial-node');
+      if (nodes.length) {
+        animate(Array.from(nodes), {
+          opacity: [0, 1],
+          scale: [0.3, 1],
+          delay: stagger(25),
+          duration: 180,
+          ease: 'out(3)'
+        });
+      }
+    });
   }
 
   function getFolderPositions() {
@@ -69,10 +137,6 @@
     });
   }
 
-  function distanceFromCenter(clientX: number, clientY: number) {
-    return Math.hypot(clientX - center.x, clientY - center.y);
-  }
-
   function handleKeyDown(e: KeyboardEvent) {
     if ((e.metaKey || e.ctrlKey) && e.key === 'e') {
       e.preventDefault();
@@ -80,24 +144,7 @@
         dismiss();
         return;
       }
-      active = true;
-      center = { x: cursor.x || window.innerWidth / 2, y: cursor.y || window.innerHeight / 2 };
-      hoveredFolder = null;
-      hoveredSession = null;
-      closeZone = false;
-
-      requestAnimationFrame(() => {
-        const nodes = document.querySelectorAll('.radial-node');
-        if (nodes.length) {
-          animate(Array.from(nodes), {
-            opacity: [0, 1],
-            scale: [0.3, 1],
-            delay: stagger(25),
-            duration: 180,
-            ease: 'out(3)'
-          });
-        }
-      });
+      activateAt(cursor.x || window.innerWidth / 2, cursor.y || window.innerHeight / 2);
     }
 
     if (e.key === 'Escape' && active) {
@@ -107,7 +154,7 @@
 
   function handleClick(e: MouseEvent) {
     if (!active) return;
-    const dist = distanceFromCenter(e.clientX, e.clientY);
+    const { dist } = localPointer(e.clientX, e.clientY);
     if (closeZone && hoveredSession) {
       onCloseSession(hoveredSession);
       dismiss();
@@ -123,12 +170,8 @@
     cursor = { x: e.clientX, y: e.clientY };
     if (!active) return;
 
-    const dist = distanceFromCenter(e.clientX, e.clientY);
+    const { dx, dy, dist } = localPointer(e.clientX, e.clientY);
     closeZone = dist > CLOSE_THRESHOLD && hoveredSession !== null;
-
-    const dx = e.clientX - center.x;
-    const dy = e.clientY - center.y;
-    const angle = Math.atan2(dy, dx);
 
     if (dist > INNER_RADIUS * 0.5 && dist < (INNER_RADIUS + OUTER_RADIUS) / 2) {
       let closest: string | null = null;
@@ -178,22 +221,31 @@
     closeZone = false;
   }
 
+  function handleResize() {
+    if (!active) return;
+    const fitted = fitActivationPoint(center.x, center.y);
+    center = fitted.center;
+    layoutScale = fitted.scale;
+  }
+
   onMount(() => {
     window.addEventListener('keydown', handleKeyDown);
     window.addEventListener('mousemove', handleMouseMove);
     window.addEventListener('click', handleClick);
+    window.addEventListener('resize', handleResize);
   });
 
   onDestroy(() => {
     window.removeEventListener('keydown', handleKeyDown);
     window.removeEventListener('mousemove', handleMouseMove);
     window.removeEventListener('click', handleClick);
+    window.removeEventListener('resize', handleResize);
   });
 </script>
 
 {#if active}
   <div class="radial-overlay" class:close-zone={closeZone}>
-    <div class="radial-center" style="left: {center.x}px; top: {center.y}px">
+    <div class="radial-center" style="left: {center.x}px; top: {center.y}px; --radial-scale: {layoutScale}">
       <!-- Inner ring: folders -->
       {#each getFolderPositions() as fp, i}
         <div
@@ -243,6 +295,7 @@
     z-index: 9999;
     backdrop-filter: blur(6px);
     background: rgba(20, 20, 18, 0.5);
+    overflow: hidden;
   }
 
   .radial-overlay.close-zone {
@@ -251,7 +304,8 @@
 
   .radial-center {
     position: absolute;
-    transform: translate(-50%, -50%);
+    transform: translate(-50%, -50%) scale(var(--radial-scale));
+    transform-origin: center;
   }
 
   .radial-hub {
