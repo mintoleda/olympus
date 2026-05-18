@@ -734,9 +734,6 @@
             {activeProviderModels}
             {filteredModels}
             {visibleCommands}
-            nonPresetStatuses={nonPresetStatuses}
-            aboveWidgets={aboveWidgets}
-            belowWidgets={belowWidgets}
             {error}
             bind:chatLogEl
             bind:draft

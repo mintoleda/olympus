@@ -15,12 +15,12 @@
     onCloseSession: (id: string) => void;
   } = $props();
 
-  let active = false;
-  let center = { x: 0, y: 0 };
-  let cursor = { x: 0, y: 0 };
-  let hoveredFolder: string | null = null;
-  let hoveredSession: string | null = null;
-  let closeZone = false;
+  let active = $state(false);
+  let center = $state({ x: 0, y: 0 });
+  let cursor = $state({ x: 0, y: 0 });
+  let hoveredFolder = $state<string | null>(null);
+  let hoveredSession = $state<string | null>(null);
+  let closeZone = $state(false);
 
   const INNER_RADIUS = 90;
   const OUTER_RADIUS = 170;
