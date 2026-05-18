@@ -16,6 +16,7 @@
   import ChatPane from './lib/components/ChatPane.svelte';
   import ExtensionRequestDialog from './lib/components/ExtensionRequestDialog.svelte';
   import HomePane from './lib/components/HomePane.svelte';
+  import RadialDock from './lib/components/RadialDock.svelte';
   import { attachPiEventListeners } from './lib/services/piEvents';
   import { piClient } from './lib/services/piClient';
   import {
@@ -880,6 +881,13 @@
       onRespond={respondToExtensionRequest}
     />
   {/if}
+
+  <RadialDock
+    {groupedSessions}
+    {activeSessionId}
+    onOpenSession={openSession}
+    onCloseSession={closeSession}
+  />
 
   <div class="fps-overlay">fps: {fps}</div>
 </main>
